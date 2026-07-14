@@ -4424,6 +4424,12 @@ void setup() {
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
   tft.init();
+  // This ST7789 driver's init sequence sends INVON unconditionally
+  // (TFT_Drivers/ST7789_Init.h doesn't actually consult TFT_INVERSION_ON/
+  // OFF), so toggling that define in User_Setup.h has no effect - turn
+  // inversion off explicitly here instead, since this panel showed black
+  // as white with it left on.
+  tft.invertDisplay(false);
   tft.setRotation(1);
   tft.fillScreen(BG_COLOR);
   tft.setTextWrap(false);

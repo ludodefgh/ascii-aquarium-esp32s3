@@ -19,10 +19,10 @@
 #define TFT_WIDTH  240
 #define TFT_HEIGHT 320
 
-// This particular panel showed inverted colours (black rendered as white)
-// with TFT_INVERSION_ON, so it's left off. Re-enable it if colours ever
-// look wrong on a different panel revision.
-// #define TFT_INVERSION_ON
+// TFT_INVERSION_ON/OFF has no effect on this driver: TFT_eSPI's
+// ST7789_Init.h sends the INVON command unconditionally, ignoring this
+// define entirely. This panel needs inversion off, so that's done with an
+// explicit tft.invertDisplay(false) call in setup() (src/main.cpp) instead.
 
 // --- Pin mapping ---
 #define TFT_MOSI 11
