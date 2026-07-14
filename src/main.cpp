@@ -4603,12 +4603,20 @@ void drawSceneLayers(TFT_eSprite& s) {
 // blocking part), then frees that buffer for reuse. Pinning this to the
 // core the Arduino loop() doesn't run on lets that blocking SPI push
 // happen concurrently with the next frame's physics/drawing on core 1.
+//
+// TFT_eSPI's SPI write path (pushPixels) is a tight polling loop with no
+// FreeRTOS yield points of its own. When core 1 keeps this task fed with a
+// new buffer the instant the previous push finishes, xSemaphoreTake never
+// actually blocks, so core 0's IDLE0 task (priority 0) never gets scheduled
+// - which starves it long enough to trip the task watchdog. The explicit
+// vTaskDelay(1) guarantees IDLE0 a scheduling window every cycle.
 static void displayTaskFn(void*) {
   for (;;) {
     xSemaphoreTake(pushRequestSem, portMAX_DELAY);
     int idx = pushBufferIndex;
     frameBuffers[idx]->pushSprite(0, 0);
     xSemaphoreGive(bufferFreeSem[idx]);
+    vTaskDelay(1);
   }
 }
 
