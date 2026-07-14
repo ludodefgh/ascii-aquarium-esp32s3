@@ -25,8 +25,18 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Update.h>
+#include <esp_heap_caps.h>
 #include <time.h>
 #include "Input.h"
+
+// Temporary diagnostic: log free heap and the largest contiguous free block
+// (what actually matters for a big mbedTLS/WiFi allocation) at each WiFi/OTA
+// step, to check whether repeated WiFi connect/OTA attempts progressively
+// fragment or leak heap.
+static void logHeap(const char* where) {
+  Serial.printf("[HEAP] %-24s free=%u minFree=%u largestBlock=%u\n", where, (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getMinFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+}
 
 static constexpr const char* kSketchVersionLabel = "v1.0-encoder";
 
@@ -4207,6 +4217,7 @@ static int otaFollowRedirects(WiFiClientSecure& client, HTTPClient& http, const 
 }
 
 static void runOtaUpdate() {
+  logHeap("runOtaUpdate start");
   if (!wifiConnected) {
     otaDrawStatus("Update failed", "WiFi not connected");
     delay(2000);
@@ -4237,7 +4248,9 @@ static void runOtaUpdate() {
   http.setConnectTimeout(15000);
   http.setTimeout(15000);
 
+  logHeap("before otaFollowRedirects");
   int httpCode = otaFollowRedirects(client, http, kOtaFirmwareUrl);
+  logHeap("after otaFollowRedirects");
   if (httpCode != HTTP_CODE_OK) {
     char err[32];
     snprintf(err, sizeof(err), "HTTP error %d", httpCode);
@@ -4265,11 +4278,13 @@ static void runOtaUpdate() {
     return;
   }
 
+  logHeap("before writeStream");
   Update.onProgress(otaProgressCallback);
   WiFiClient* stream = http.getStreamPtr();
   size_t written = Update.writeStream(*stream);
   http.end();
   Serial.printf("[OTA] wrote %u/%d bytes\n", (unsigned)written, len);
+  logHeap("after writeStream");
 
   if (written != (size_t)len) {
     char err[40];
@@ -4370,15 +4385,21 @@ void menuHandleInput() {
       }
       if (pushed) {
         if (wifiListCursor == 0) {
+          logHeap("before setWifiEnabled");
           setWifiEnabled(!wifiEnabled);
+          logHeap("after setWifiEnabled");
         } else if (wifiListCursor == 1) {
           if (wifiEnabled) {
+            logHeap("before startWifiScan");
             startWifiScan();
+            logHeap("after startWifiScan");
             wifiNetCursor = 0;
             menuMode = MENU_MODE_WIFI_NETWORKS;
           }
         } else if (wifiConnected) {
+          logHeap("before runOtaUpdate");
           runOtaUpdate();  // blocking; only returns on failure
+          logHeap("after runOtaUpdate");
           menuTouch();
         }
         menuTouch();
@@ -4814,5 +4835,11 @@ void loop() {
     fps = (frameCount * 1000.0f) / (now - fpsTimer + 1);
     frameCount = 0;
     fpsTimer = now;
+  }
+
+  static unsigned long lastHeapLogMs = 0;
+  if (now - lastHeapLogMs >= 10000UL) {
+    logHeap("periodic");
+    lastHeapLogMs = now;
   }
 }
