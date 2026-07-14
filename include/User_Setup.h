@@ -36,6 +36,13 @@
 // --- SPI speed ---
 #define SPI_FREQUENCY  40000000
 
+// TFT_eSPI's ESP32-S3 SPI port defaults to `FSPI`, which Arduino-ESP32 core
+// 3.x maps to SPI host 0 - invalid on S3 (only hosts 2/3 exist), causing a
+// hard fault on the very first transaction. Force a valid host instead.
+// See Bodmer/TFT_eSPI#3488 ("Fix Boot Loop on ESP32S3 Due to Mis-defined SPI
+// Port").
+#define USE_HSPI_PORT
+
 // --- Fonts ---
 #define LOAD_GLCD
 #define LOAD_FONT2
@@ -44,7 +51,4 @@
 #define LOAD_FONT7
 #define LOAD_FONT8
 #define LOAD_GFXFF
-// SMOOTH_FONT (VLW anti-aliased fonts loaded from SPIFFS) is intentionally
-// left off: this sketch only uses the built-in fixed fonts above, and the
-// Arduino-ESP32 2.0.18 core build used here (see platformio.ini comment)
-// doesn't ship a SPIFFS library, which TFT_eSPI would otherwise require.
+#define SMOOTH_FONT
