@@ -19,9 +19,10 @@
 #define TFT_WIDTH  240
 #define TFT_HEIGHT 320
 
-// Most 2.4" ST7789 modules need this to avoid inverted colours.
-// Comment out if colours look wrong on first boot.
-#define TFT_INVERSION_ON
+// This particular panel showed inverted colours (black rendered as white)
+// with TFT_INVERSION_ON, so it's left off. Re-enable it if colours ever
+// look wrong on a different panel revision.
+// #define TFT_INVERSION_ON
 
 // --- Pin mapping ---
 #define TFT_MOSI 11
