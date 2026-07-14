@@ -4168,6 +4168,44 @@ static void otaProgressCallback(size_t done, size_t total) {
   otaDrawStatus("Updating...", pct);
 }
 
+// GitHub's release-asset download is a redirect chain across two different
+// hosts (github.com -> release-assets.githubusercontent.com). Letting
+// HTTPClient's built-in HTTPC_STRICT_FOLLOW_REDIRECTS handle that
+// automatically was an intermittent, hard-to-debug source of hangs, so each
+// hop gets a deliberately fresh HTTPClient/GET here instead - simpler to
+// reason about, and each failure logs exactly which hop and HTTP code it
+// died on.
+static int otaFollowRedirects(WiFiClientSecure& client, HTTPClient& http, const char* startUrl) {
+  String url = startUrl;
+  for (int hop = 0; hop < 5; ++hop) {
+    http.end();
+    Serial.printf("[OTA] hop %d -> %s\n", hop, url.c_str());
+    otaDrawStatus("Connecting...", hop == 0 ? "github.com" : "download server");
+    if (!http.begin(client, url)) {
+      Serial.println("[OTA] http.begin() failed");
+      return -1;
+    }
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    const char* headerKeys[] = {"Location"};
+    http.collectHeaders(headerKeys, 1);
+    int code = http.GET();
+    Serial.printf("[OTA] hop %d HTTP code %d\n", hop, code);
+    if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND || code == HTTP_CODE_SEE_OTHER ||
+        code == HTTP_CODE_TEMPORARY_REDIRECT || code == HTTP_CODE_PERMANENT_REDIRECT) {
+      String location = http.header("Location");
+      if (location.length() == 0) {
+        Serial.println("[OTA] redirect with no Location header");
+        return code;
+      }
+      url = location;
+      continue;
+    }
+    return code;
+  }
+  Serial.println("[OTA] too many redirects");
+  return -1;
+}
+
 static void runOtaUpdate() {
   if (!wifiConnected) {
     otaDrawStatus("Update failed", "WiFi not connected");
@@ -4187,6 +4225,7 @@ static void runOtaUpdate() {
   while (time(nullptr) < 1700000000 && millis() - waitStart < 10000UL) {
     delay(200);
   }
+  Serial.printf("[OTA] clock at start: %ld\n", (long)time(nullptr));
 
   otaDrawStatus("Checking for update...");
 
@@ -4197,17 +4236,12 @@ static void runOtaUpdate() {
   HTTPClient http;
   http.setConnectTimeout(15000);
   http.setTimeout(15000);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  if (!http.begin(client, kOtaFirmwareUrl)) {
-    otaDrawStatus("Update failed", "Could not start request");
-    delay(2000);
-    return;
-  }
 
-  int httpCode = http.GET();
+  int httpCode = otaFollowRedirects(client, http, kOtaFirmwareUrl);
   if (httpCode != HTTP_CODE_OK) {
     char err[32];
     snprintf(err, sizeof(err), "HTTP error %d", httpCode);
+    Serial.printf("[OTA] failed: %s\n", err);
     otaDrawStatus("Update failed", err);
     http.end();
     delay(2000);
@@ -4215,6 +4249,7 @@ static void runOtaUpdate() {
   }
 
   int len = http.getSize();
+  Serial.printf("[OTA] content length: %d\n", len);
   if (len <= 0) {
     otaDrawStatus("Update failed", "Unknown download size");
     http.end();
@@ -4223,6 +4258,7 @@ static void runOtaUpdate() {
   }
 
   if (!Update.begin(len)) {
+    Serial.printf("[OTA] Update.begin failed: %s\n", Update.errorString());
     otaDrawStatus("Update failed", "Not enough OTA space");
     http.end();
     delay(2000);
@@ -4233,6 +4269,7 @@ static void runOtaUpdate() {
   WiFiClient* stream = http.getStreamPtr();
   size_t written = Update.writeStream(*stream);
   http.end();
+  Serial.printf("[OTA] wrote %u/%d bytes\n", (unsigned)written, len);
 
   if (written != (size_t)len) {
     char err[40];
@@ -4244,11 +4281,13 @@ static void runOtaUpdate() {
   }
 
   if (!Update.end(true) || !Update.isFinished()) {
+    Serial.printf("[OTA] Update.end failed: %s\n", Update.errorString());
     otaDrawStatus("Update failed", Update.errorString());
     delay(2000);
     return;
   }
 
+  Serial.println("[OTA] success, rebooting");
   otaDrawStatus("Update complete", "Rebooting...");
   delay(1200);
   ESP.restart();
