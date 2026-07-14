@@ -22,10 +22,74 @@
 #include <Preferences.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <Update.h>
 #include <time.h>
 #include "Input.h"
 
 static constexpr const char* kSketchVersionLabel = "v1.0-encoder";
+
+// GitHub's "latest/download/<asset>" URL always redirects to whatever
+// release is currently marked latest, so this never needs updating when a
+// new version ships - only the release itself needs a "firmware.bin" asset.
+static constexpr const char* kOtaFirmwareUrl =
+    "https://github.com/ludodefgh/ascii-aquarium-esp32s3/releases/latest/download/firmware.bin";
+
+// Root CAs needed to validate the OTA download's TLS chain without
+// disabling certificate checking: github.com itself (Sectigo, chains to
+// USERTrust ECC) redirects to a release-assets.githubusercontent.com CDN
+// URL (Let's Encrypt, chains to ISRG Root X1) that serves the actual bytes.
+// Both roots are long-lived (valid into 2035/2038) and self-signed, so this
+// bundle only needs to change if GitHub switches CA providers.
+static constexpr const char* kOtaTrustedRootCAs =
+    "-----BEGIN CERTIFICATE-----\n"
+    "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\n"
+    "-----END CERTIFICATE-----\n"
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIICjzCCAhWgAwIBAgIQXIuZxVqUxdJxVt7NiYDMJjAKBggqhkjOPQQDAzCBiDEL\n"
+    "MAkGA1UEBhMCVVMxEzARBgNVBAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNl\n"
+    "eSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMT\n"
+    "JVVTRVJUcnVzdCBFQ0MgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMTAwMjAx\n"
+    "MDAwMDAwWhcNMzgwMTE4MjM1OTU5WjCBiDELMAkGA1UEBhMCVVMxEzARBgNVBAgT\n"
+    "Ck5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNleSBDaXR5MR4wHAYDVQQKExVUaGUg\n"
+    "VVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMTJVVTRVJUcnVzdCBFQ0MgQ2VydGlm\n"
+    "aWNhdGlvbiBBdXRob3JpdHkwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAQarFRaqflo\n"
+    "I+d61SRvU8Za2EurxtW20eZzca7dnNYMYf3boIkDuAUU7FfO7l0/4iGzzvfUinng\n"
+    "o4N+LZfQYcTxmdwlkWOrfzCjtHDix6EznPO/LlxTsV+zfTJ/ijTjeXmjQjBAMB0G\n"
+    "A1UdDgQWBBQ64QmG1M8ZwpZ2dEl23OA1xmNjmjAOBgNVHQ8BAf8EBAMCAQYwDwYD\n"
+    "VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAwNoADBlAjA2Z6EWCNzklwBBHU6+4WMB\n"
+    "zzuqQhFkoJ2UOQIReVx7Hfpkue4WQrO/isIJxOzksU0CMQDpKmFHjFJKS04YcPbW\n"
+    "RNZu9YO6bVi9JNlWSOrvxKJGgYhqOkbRqZtNyWHa0V1Xahg=\n"
+    "-----END CERTIFICATE-----\n";
 
 // ------------------------------ Display Geometry -----------------------------
 static const int SCREEN_W = 320;
@@ -870,7 +934,22 @@ static const int kAltFishColorCount = sizeof(kAltFishColors) / sizeof(kAltFishCo
 // ===== part: new_globals =====
 // ------------------------------ Globals --------------------------------------
 TFT_eSPI tft = TFT_eSPI();
+
+// Double-buffered rendering: the main loop (core 1) draws a frame into one
+// sprite while a dedicated task on core 0 concurrently pushes the other
+// sprite out over SPI, so SPI transfer time overlaps with the next frame's
+// physics/drawing instead of blocking it. Both land in PSRAM automatically
+// (TFT_eSprite prefers PSRAM whenever psramFound() is true), so this costs
+// PSRAM, not the scarce internal SRAM.
 TFT_eSprite canvas = TFT_eSprite(&tft);
+TFT_eSprite canvas2 = TFT_eSprite(&tft);
+static TFT_eSprite* const frameBuffers[2] = {&canvas, &canvas2};
+static SemaphoreHandle_t bufferFreeSem[2] = {nullptr, nullptr};
+static SemaphoreHandle_t pushRequestSem = nullptr;
+static volatile int pushBufferIndex = 0;
+static int drawBufferIndex = 0;
+static TaskHandle_t displayTaskHandle = nullptr;
+
 Preferences prefs;
 
 Fish fishPool[MAX_FISH_POOL];
@@ -1054,6 +1133,8 @@ void clearRenderSurface(TFT_eSprite& s) {
 bool allocateMainCanvas() {
   canvas.setColorDepth(MAIN_SPRITE_COLOR_DEPTH);
   if (canvas.createSprite(SCREEN_W, SCREEN_H) == nullptr) return false;
+  canvas2.setColorDepth(MAIN_SPRITE_COLOR_DEPTH);
+  if (canvas2.createSprite(SCREEN_W, SCREEN_H) == nullptr) return false;
   mainCanvasActualColorDepth = MAIN_SPRITE_COLOR_DEPTH;
   mainCanvasRenderHeight = SCREEN_H;
   return true;
@@ -4063,6 +4144,100 @@ static void menuActivateItem() {
   menuMode = MENU_MODE_EDIT;
 }
 
+// ------------------------------ OTA update -------------------------------------
+// Fully blocking and takes over the physical display directly (bypassing the
+// canvas/menu system) - this is a rare, deliberate action, not something that
+// needs to keep the aquarium animating underneath it. The dual-core display
+// task keeps idling on its semaphore meanwhile, so there's no conflict over
+// the SPI bus.
+static void otaDrawStatus(const char* line1, const char* line2 = nullptr) {
+  tft.fillScreen(BG_COLOR);
+  tft.setTextFont(2);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_CYAN, BG_COLOR);
+  tft.drawString(line1, SCREEN_W / 2, SCREEN_H / 2 - 10);
+  if (line2) {
+    tft.setTextColor(TFT_WHITE, BG_COLOR);
+    tft.drawString(line2, SCREEN_W / 2, SCREEN_H / 2 + 14);
+  }
+}
+
+static void otaProgressCallback(size_t done, size_t total) {
+  char pct[8];
+  snprintf(pct, sizeof(pct), "%u%%", total ? (unsigned)((done * 100ULL) / total) : 0);
+  otaDrawStatus("Updating...", pct);
+}
+
+static void runOtaUpdate() {
+  if (!wifiConnected) {
+    otaDrawStatus("Update failed", "WiFi not connected");
+    delay(2000);
+    return;
+  }
+
+  otaDrawStatus("Checking for update...");
+
+  WiFiClientSecure client;
+  client.setCACert(kOtaTrustedRootCAs);
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, kOtaFirmwareUrl)) {
+    otaDrawStatus("Update failed", "Could not start request");
+    delay(2000);
+    return;
+  }
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    char err[32];
+    snprintf(err, sizeof(err), "HTTP error %d", httpCode);
+    otaDrawStatus("Update failed", err);
+    http.end();
+    delay(2000);
+    return;
+  }
+
+  int len = http.getSize();
+  if (len <= 0) {
+    otaDrawStatus("Update failed", "Unknown download size");
+    http.end();
+    delay(2000);
+    return;
+  }
+
+  if (!Update.begin(len)) {
+    otaDrawStatus("Update failed", "Not enough OTA space");
+    http.end();
+    delay(2000);
+    return;
+  }
+
+  Update.onProgress(otaProgressCallback);
+  WiFiClient* stream = http.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+  http.end();
+
+  if (written != (size_t)len) {
+    char err[40];
+    snprintf(err, sizeof(err), "Wrote %u/%u bytes", (unsigned)written, (unsigned)len);
+    otaDrawStatus("Update failed", err);
+    Update.end(false);
+    delay(2000);
+    return;
+  }
+
+  if (!Update.end(true) || !Update.isFinished()) {
+    otaDrawStatus("Update failed", Update.errorString());
+    delay(2000);
+    return;
+  }
+
+  otaDrawStatus("Update complete", "Rebooting...");
+  delay(1200);
+  ESP.restart();
+}
+
 // ------------------------------ Input dispatch --------------------------------
 void menuHandleInput() {
   wifiPanelOpen = (menuMode == MENU_MODE_WIFI_LIST || menuMode == MENU_MODE_WIFI_NETWORKS ||
@@ -4135,16 +4310,21 @@ void menuHandleInput() {
     }
     case MENU_MODE_WIFI_LIST: {
       if (delta != 0) {
-        wifiListCursor = ((wifiListCursor + delta) % 2 + 2) % 2;
+        wifiListCursor = ((wifiListCursor + delta) % 3 + 3) % 3;
         menuTouch();
       }
       if (pushed) {
         if (wifiListCursor == 0) {
           setWifiEnabled(!wifiEnabled);
-        } else if (wifiEnabled) {
-          startWifiScan();
-          wifiNetCursor = 0;
-          menuMode = MENU_MODE_WIFI_NETWORKS;
+        } else if (wifiListCursor == 1) {
+          if (wifiEnabled) {
+            startWifiScan();
+            wifiNetCursor = 0;
+            menuMode = MENU_MODE_WIFI_NETWORKS;
+          }
+        } else if (wifiConnected) {
+          runOtaUpdate();  // blocking; only returns on failure
+          menuTouch();
         }
         menuTouch();
       }
@@ -4302,6 +4482,13 @@ static void drawWifiListScreen(TFT_eSprite& s) {
   s.setTextColor(wifiEnabled ? TFT_WHITE : TFT_DARKGREY, row1 ? TFT_NAVY : TFT_BLACK);
   s.drawString("Scan Networks", MENU_PANEL_X + 10, y + MENU_ROW_H / 2);
 
+  y += MENU_ROW_H + 4;
+  bool row2 = (wifiListCursor == 2);
+  s.fillRect(MENU_PANEL_X + 4, y, MENU_PANEL_W - 8, MENU_ROW_H, row2 ? TFT_NAVY : TFT_BLACK);
+  s.setTextDatum(ML_DATUM);
+  s.setTextColor(wifiConnected ? TFT_WHITE : TFT_DARKGREY, row2 ? TFT_NAVY : TFT_BLACK);
+  s.drawString("Check for Update", MENU_PANEL_X + 10, y + MENU_ROW_H / 2);
+
   y += MENU_ROW_H + 12;
   s.setTextDatum(ML_DATUM);
   s.setTextColor(TFT_CYAN, TFT_BLACK);
@@ -4412,11 +4599,34 @@ void drawSceneLayers(TFT_eSprite& s) {
   s.drawString(fpsText, SCREEN_W - 2, 2);
 }
 
+// Runs on core 0: waits for a filled buffer, pushes it over SPI (the
+// blocking part), then frees that buffer for reuse. Pinning this to the
+// core the Arduino loop() doesn't run on lets that blocking SPI push
+// happen concurrently with the next frame's physics/drawing on core 1.
+static void displayTaskFn(void*) {
+  for (;;) {
+    xSemaphoreTake(pushRequestSem, portMAX_DELAY);
+    int idx = pushBufferIndex;
+    frameBuffers[idx]->pushSprite(0, 0);
+    xSemaphoreGive(bufferFreeSem[idx]);
+  }
+}
+
 void renderFrame() {
   if (!spriteReady) return;
-  applyRenderViewport(canvas);
-  drawSceneLayers(canvas);
-  canvas.pushSprite(0, 0);
+
+  // Wait until this buffer's previous push (from two frames ago) is done
+  // before drawing into it again.
+  xSemaphoreTake(bufferFreeSem[drawBufferIndex], portMAX_DELAY);
+
+  TFT_eSprite& s = *frameBuffers[drawBufferIndex];
+  applyRenderViewport(s);
+  drawSceneLayers(s);
+
+  pushBufferIndex = drawBufferIndex;
+  xSemaphoreGive(pushRequestSem);
+
+  drawBufferIndex ^= 1;
 }
 
 // ===== part: new_setup_loop =====
@@ -4449,6 +4659,13 @@ void setup() {
 
   if (spriteReady) {
     canvas.setTextFont(2);
+    canvas2.setTextFont(2);
+    bufferFreeSem[0] = xSemaphoreCreateBinary();
+    bufferFreeSem[1] = xSemaphoreCreateBinary();
+    pushRequestSem = xSemaphoreCreateBinary();
+    xSemaphoreGive(bufferFreeSem[0]);  // both buffers start out free
+    xSemaphoreGive(bufferFreeSem[1]);
+    xTaskCreatePinnedToCore(displayTaskFn, "display", 4096, nullptr, 1, &displayTaskHandle, 0);
     allocateGradientBandCache();
     tft.setCursor(10, 28);
     tft.setTextColor(TFT_CYAN, BG_COLOR);

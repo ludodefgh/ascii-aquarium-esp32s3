@@ -28,8 +28,8 @@ No MISO wired (display is write-only).
 - **Push encoder**: feed the fish (home screen) / select or confirm a menu item.
 - **K0**: cycle background style (home screen) / back out of a menu screen.
 
-WiFi credentials (for NTP time sync) are entered with an on-screen character picker driven by the
-encoder, since there's no touchscreen keyboard.
+WiFi credentials (for NTP time sync and OTA updates) are entered with an on-screen character
+picker driven by the encoder, since there's no touchscreen keyboard.
 
 ## What's kept vs. removed from the original
 
@@ -39,6 +39,24 @@ ASCII-art, 20 fonts), and WiFi + NTP sync.
 
 Removed: XPT2046 touch input and calibration, SD-card BMP/sequence capture, and ambient RGB LED
 control — none of that hardware exists on this board.
+
+## Performance
+
+The scene renders into one of two sprite buffers (both allocated in PSRAM); a task pinned to core
+0 pushes the finished buffer over SPI while core 1 (the normal `loop()`) draws the next frame into
+the other buffer, so SPI transfer time overlaps with drawing/physics instead of blocking it.
+
+## OTA updates
+
+WiFi menu → "Check for Update" downloads the `firmware.bin` asset from this repo's latest release
+and flashes it to the inactive OTA partition (`Update.h`) before rebooting — no cable needed after
+the first flash. It only touches the OTA app partition, never NVS, so WiFi credentials and tank
+settings survive an update.
+
+**USB reflashes are different**: `ascii-aquarium-merged.bin` spans the whole flash range including
+the gap where the `nvs` partition lives, so flashing it wipes saved WiFi credentials and settings
+every time. For a routine reflash that preserves them, flash only `firmware.bin` at `0x10000`; only
+use the merged image (or the full four-file set) for a first flash on a blank chip.
 
 ## Build
 
