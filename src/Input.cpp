@@ -37,10 +37,12 @@ struct DebouncedButton {
     bool rawState = false;
     bool edgeFired = false;
     unsigned long lastChangeMs = 0;
+
+    explicit DebouncedButton(uint8_t p) : pin(p) {}
 };
 
-static DebouncedButton s_encBtn{PIN_ENC_PUSH};
-static DebouncedButton s_k0Btn{PIN_K0};
+static DebouncedButton s_encBtn(PIN_ENC_PUSH);
+static DebouncedButton s_k0Btn(PIN_K0);
 
 static const unsigned long kDebounceMs = 25;
 

@@ -44,4 +44,7 @@
 #define LOAD_FONT7
 #define LOAD_FONT8
 #define LOAD_GFXFF
-#define SMOOTH_FONT
+// SMOOTH_FONT (VLW anti-aliased fonts loaded from SPIFFS) is intentionally
+// left off: this sketch only uses the built-in fixed fonts above, and the
+// Arduino-ESP32 2.0.18 core build used here (see platformio.ini comment)
+// doesn't ship a SPIFFS library, which TFT_eSPI would otherwise require.
