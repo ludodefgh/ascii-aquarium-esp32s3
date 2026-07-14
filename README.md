@@ -28,6 +28,9 @@ No MISO wired (display is write-only).
 - **Push encoder**: feed the fish (home screen) / select or confirm a menu item.
 - **K0**: cycle background style (home screen) / back out of a menu screen.
 
+Settings menu includes fish/bubble/seaweed/creature counts, background style, LCD brightness
+(PWM on the backlight pin), the optional clock, and WiFi/OTA.
+
 WiFi credentials (for NTP time sync and OTA updates) are entered with an on-screen character
 picker driven by the encoder, since there's no touchscreen keyboard.
 
@@ -48,10 +51,16 @@ the other buffer, so SPI transfer time overlaps with drawing/physics instead of 
 
 ## OTA updates
 
-WiFi menu → "Check for Update" downloads the `firmware.bin` asset from this repo's latest release
-and flashes it to the inactive OTA partition (`Update.h`) before rebooting — no cable needed after
-the first flash. It only touches the OTA app partition, never NVS, so WiFi credentials and tank
+WiFi menu → "Check for Update" first does a cheap redirect-only request to learn the latest
+release's tag and compares it against the running firmware's version (shown just below the WiFi
+status line in that same menu) — if there's nothing newer, it says so and skips the download
+entirely. Otherwise it downloads the `firmware.bin` asset from this repo's latest release and
+flashes it to the inactive OTA partition (`Update.h`) before rebooting — no cable needed after the
+first flash. It only touches the OTA app partition, never NVS, so WiFi credentials and tank
 settings survive an update.
+
+**Remember to bump `kFirmwareVersion` in `src/main.cpp`** before tagging a new release — that's the
+value the version check compares against.
 
 **USB reflashes are different**: `ascii-aquarium-merged.bin` spans the whole flash range including
 the gap where the `nvs` partition lives, so flashing it wipes saved WiFi credentials and settings

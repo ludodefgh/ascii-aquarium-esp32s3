@@ -38,13 +38,22 @@ static void logHeap(const char* where) {
                 (unsigned)ESP.getMinFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
-static constexpr const char* kSketchVersionLabel = "v1.0-encoder";
+// Bump this on every release - it's what "Check for Update" compares
+// against the latest GitHub release tag to decide whether there's actually
+// anything newer to download.
+static constexpr const char* kFirmwareVersion = "v1.0.13";
+static constexpr const char* kSketchVersionLabel = kFirmwareVersion;
 
 // GitHub's "latest/download/<asset>" URL always redirects to whatever
 // release is currently marked latest, so this never needs updating when a
 // new version ships - only the release itself needs a "firmware.bin" asset.
 static constexpr const char* kOtaFirmwareUrl =
     "https://github.com/ludodefgh/ascii-aquarium-esp32s3/releases/latest/download/firmware.bin";
+// Lightweight redirect (no body) instead of hitting the JSON API, just to
+// learn the latest release's tag name before deciding whether to download
+// the (much bigger) firmware.bin at all.
+static constexpr const char* kOtaLatestReleaseUrl =
+    "https://github.com/ludodefgh/ascii-aquarium-esp32s3/releases/latest";
 
 // Root CAs needed to validate the OTA download's TLS chain without
 // disabling certificate checking: github.com itself (Sectigo, chains to
@@ -1000,6 +1009,16 @@ uint16_t autoSkyNightColor = DEFAULT_AUTO_SKY_NIGHT_COLOR;
 uint16_t autoSkyGradientColor = DEFAULT_AUTO_SKY_DAY_COLOR;
 unsigned long lastBackgroundRainbowUpdateMs = 0;
 AutoSkySlot activeAutoSkyColorSlot = AUTO_SKY_SLOT_NONE;
+
+static const int MIN_LCD_BRIGHTNESS = 10;
+static const int MAX_LCD_BRIGHTNESS = 100;
+static const int DEFAULT_LCD_BRIGHTNESS = 100;
+static const int LCD_BRIGHTNESS_STEP = 5;
+int lcdBrightness = DEFAULT_LCD_BRIGHTNESS;
+
+void applyLcdBrightness() {
+  ledcWrite(TFT_BL, (uint32_t)((lcdBrightness * 255) / 100));
+}
 
 bool clockVisible = false;
 bool clockUse24Hour = false;
@@ -2527,6 +2546,7 @@ void savePersistentState() {
   prefs.putBool("wifi_on", wifiEnabled);
   prefs.putString("wifi_ssid", wifiSsid);
   prefs.putString("wifi_pass", wifiPass);
+  prefs.putInt("lcd_brite", lcdBrightness);
   prefs.putBytes("flowers", pixelFlowers, sizeof(pixelFlowers));
   prefs.end();
   settingsDirty = false;
@@ -2578,6 +2598,7 @@ void loadPersistentState() {
     wifiEnabled = prefs.getBool("wifi_on", false);
     prefs.getString("wifi_ssid", wifiSsid, sizeof(wifiSsid));
     prefs.getString("wifi_pass", wifiPass, sizeof(wifiPass));
+    lcdBrightness = prefs.getInt("lcd_brite", DEFAULT_LCD_BRIGHTNESS);
     size_t flowerBytes = prefs.getBytesLength("flowers");
     if (flowerBytes == sizeof(pixelFlowers)) {
       prefs.getBytes("flowers", pixelFlowers, sizeof(pixelFlowers));
@@ -2592,6 +2613,7 @@ void loadPersistentState() {
   autoFeedFrequency = normalizeAutoFeedFrequency(autoFeedFrequency);
   snailFrequency = normalizeCreatureFrequency(snailFrequency);
   jellyfishFrequency = normalizeCreatureFrequency(jellyfishFrequency);
+  lcdBrightness = clampVal(lcdBrightness, MIN_LCD_BRIGHTNESS, MAX_LCD_BRIGHTNESS);
   seaweedSwaySpeed = clampVal(seaweedSwaySpeed, MIN_SWAY, MAX_SWAY);
   seaweedLength = clampVal(seaweedLength, MIN_SEAWEED_LENGTH, MAX_SEAWEED_LENGTH);
   seaweedLengthRandomness = clampVal(seaweedLengthRandomness, MIN_SEAWEED_LENGTH_RANDOMNESS, MAX_SEAWEED_LENGTH_RANDOMNESS);
@@ -3892,6 +3914,7 @@ enum MenuItemId {
   MENU_BUBBLE_COUNT,
   MENU_BACKGROUND_STYLE,
   MENU_BACKGROUND_RAINBOW,
+  MENU_BRIGHTNESS,
   MENU_SEAWEED_SWAY,
   MENU_SEAWEED_LENGTH,
   MENU_OCTOPUS_FREQ,
@@ -3917,6 +3940,7 @@ static const char* const kMenuLabels[MENU_ITEM_COUNT] = {
     "Bubble Count",
     "Background",
     "Bg Rainbow",
+    "Brightness",
     "Seaweed Sway",
     "Seaweed Length",
     "Octopus Visits",
@@ -4016,6 +4040,9 @@ static void menuFormatValue(MenuItemId id, char* out, size_t cap) {
     case MENU_BACKGROUND_RAINBOW:
       copySafe(out, cap, backgroundRainbowEnabled ? "On" : "Off");
       return;
+    case MENU_BRIGHTNESS:
+      snprintf(out, cap, "%d%%", lcdBrightness);
+      return;
     case MENU_SEAWEED_SWAY:
       snprintf(out, cap, "%.2f", (double)seaweedSwaySpeed);
       return;
@@ -4084,6 +4111,10 @@ static void menuAdjustItem(MenuItemId id, int delta) {
       break;
     case MENU_BACKGROUND_RAINBOW:
       setBackgroundRainbowEnabled(!backgroundRainbowEnabled);
+      break;
+    case MENU_BRIGHTNESS:
+      lcdBrightness = clampVal(lcdBrightness + delta * LCD_BRIGHTNESS_STEP, MIN_LCD_BRIGHTNESS, MAX_LCD_BRIGHTNESS);
+      applyLcdBrightness();
       break;
     case MENU_SEAWEED_SWAY:
       seaweedSwaySpeed = clampVal(seaweedSwaySpeed + delta * 0.05f, MIN_SWAY, MAX_SWAY);
@@ -4216,6 +4247,46 @@ static int otaFollowRedirects(WiFiClientSecure& client, HTTPClient& http, const 
   return -1;
 }
 
+static void parseVersionTag(const char* tag, int& major, int& minor, int& patch) {
+  major = minor = patch = 0;
+  if (tag[0] == 'v' || tag[0] == 'V') tag++;
+  sscanf(tag, "%d.%d.%d", &major, &minor, &patch);
+}
+
+// Returns >0 if `a` is newer than `b`, <0 if older, 0 if equal.
+static int compareVersions(const char* a, const char* b) {
+  int aMaj, aMin, aPatch, bMaj, bMin, bPatch;
+  parseVersionTag(a, aMaj, aMin, aPatch);
+  parseVersionTag(b, bMaj, bMin, bPatch);
+  if (aMaj != bMaj) return aMaj - bMaj;
+  if (aMin != bMin) return aMin - bMin;
+  return aPatch - bPatch;
+}
+
+// Cheap check for what the latest release actually is: this URL 302s
+// straight to ".../releases/tag/<tag>" with no response body, so reading
+// just the Location header tells us the latest version without pulling the
+// ~12KB JSON API response or (much bigger) firmware.bin.
+static bool fetchLatestVersionTag(WiFiClientSecure& client, HTTPClient& http, char* out, size_t cap) {
+  http.end();
+  if (!http.begin(client, kOtaLatestReleaseUrl)) return false;
+  http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  const char* headerKeys[] = {"Location"};
+  http.collectHeaders(headerKeys, 1);
+  int code = http.GET();
+  Serial.printf("[OTA] version check HTTP code %d\n", code);
+  if (code != HTTP_CODE_MOVED_PERMANENTLY && code != HTTP_CODE_FOUND) {
+    http.end();
+    return false;
+  }
+  String location = http.header("Location");
+  http.end();
+  int slash = location.lastIndexOf('/');
+  if (slash < 0) return false;
+  copySafe(out, cap, location.c_str() + slash + 1);
+  return out[0] != '\0';
+}
+
 static void runOtaUpdate() {
   logHeap("runOtaUpdate start");
   if (!wifiConnected) {
@@ -4247,6 +4318,20 @@ static void runOtaUpdate() {
   HTTPClient http;
   http.setConnectTimeout(15000);
   http.setTimeout(15000);
+
+  char latestTag[24] = "";
+  if (fetchLatestVersionTag(client, http, latestTag, sizeof(latestTag))) {
+    Serial.printf("[OTA] installed=%s latest=%s\n", kFirmwareVersion, latestTag);
+    if (compareVersions(latestTag, kFirmwareVersion) <= 0) {
+      char msg[32];
+      snprintf(msg, sizeof(msg), "%s is current", kFirmwareVersion);
+      otaDrawStatus("Already up to date", msg);
+      delay(2500);
+      return;
+    }
+  } else {
+    Serial.println("[OTA] version check failed, downloading anyway");
+  }
 
   logHeap("before otaFollowRedirects");
   int httpCode = otaFollowRedirects(client, http, kOtaFirmwareUrl);
@@ -4572,6 +4657,12 @@ static void drawWifiListScreen(TFT_eSprite& s) {
   snprintf(statusLine, sizeof(statusLine), "Status: %s", wifiStatusText);
   s.drawString(statusLine, MENU_PANEL_X + 10, y);
 
+  y += MENU_ROW_H - 2;
+  s.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  char versionLine[32];
+  snprintf(versionLine, sizeof(versionLine), "Version: %s", kFirmwareVersion);
+  s.drawString(versionLine, MENU_PANEL_X + 10, y);
+
   drawMenuFooter(s, "Push: select   K0: back");
 }
 
@@ -4724,8 +4815,8 @@ void setup() {
 
   inputInit();
 
-  pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
+  ledcAttach(TFT_BL, 5000, 8);
+  applyLcdBrightness();
   tft.init();
   // This ST7789 driver's init sequence sends INVON unconditionally
   // (TFT_Drivers/ST7789_Init.h doesn't actually consult TFT_INVERSION_ON/
