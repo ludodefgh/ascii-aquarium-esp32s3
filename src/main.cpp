@@ -4401,6 +4401,15 @@ void drawSceneLayers(TFT_eSprite& s) {
   drawSeahorse(s);
   drawClock(s);
   drawMenuOverlay(s);
+
+  // Temporary diagnostic readout while chasing a reported stutter in fish
+  // movement - remove once frame timing is confirmed smooth.
+  char fpsText[12];
+  snprintf(fpsText, sizeof(fpsText), "%.0ffps", fps);
+  s.setTextFont(1);
+  s.setTextDatum(TR_DATUM);
+  s.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  s.drawString(fpsText, SCREEN_W - 2, 2);
 }
 
 void renderFrame() {

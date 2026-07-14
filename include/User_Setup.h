@@ -35,7 +35,13 @@
 // TFT_MISO intentionally not defined: MISO is not wired on this board.
 
 // --- SPI speed ---
-#define SPI_FREQUENCY  40000000
+// Bumped from a conservative 40MHz: the full 320x240 canvas is pushed over
+// SPI every single frame (no dirty-rect/partial update), so SPI transfer
+// time eats directly into frame budget - raise this first if animation
+// looks choppy. 80MHz is the common ceiling for ST7789 modules; drop back
+// to 40MHz if the screen shows visible corruption/noise instead (a sign the
+// wiring can't handle it).
+#define SPI_FREQUENCY  80000000
 
 // TFT_eSPI's ESP32-S3 SPI port defaults to `FSPI`, which Arduino-ESP32 core
 // 3.x maps to SPI host 0 - invalid on S3 (only hosts 2/3 exist), causing a
