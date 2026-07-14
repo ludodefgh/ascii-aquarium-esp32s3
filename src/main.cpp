@@ -4175,12 +4175,28 @@ static void runOtaUpdate() {
     return;
   }
 
+  // TLS certificate validation checks the cert's validity dates against the
+  // device's system clock. Right after WiFi connects, NTP sync is still
+  // running in the background (see serviceInternetTime()), so the clock can
+  // still read ~1970 for a few seconds - which makes every real-world
+  // certificate look "not yet valid" and the handshake hang/retry for a long
+  // time before failing. Wait for a sane-looking time (or give up after 10s
+  // and try anyway) before opening the connection.
+  otaDrawStatus("Waiting for time sync...");
+  unsigned long waitStart = millis();
+  while (time(nullptr) < 1700000000 && millis() - waitStart < 10000UL) {
+    delay(200);
+  }
+
   otaDrawStatus("Checking for update...");
 
   WiFiClientSecure client;
   client.setCACert(kOtaTrustedRootCAs);
+  client.setTimeout(15000);
 
   HTTPClient http;
+  http.setConnectTimeout(15000);
+  http.setTimeout(15000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   if (!http.begin(client, kOtaFirmwareUrl)) {
     otaDrawStatus("Update failed", "Could not start request");
