@@ -41,7 +41,7 @@ static void logHeap(const char* where) {
 // Bump this on every release - it's what "Check for Update" compares
 // against the latest GitHub release tag to decide whether there's actually
 // anything newer to download.
-static constexpr const char* kFirmwareVersion = "v1.0.15";
+static constexpr const char* kFirmwareVersion = "v1.0.16";
 static constexpr const char* kSketchVersionLabel = kFirmwareVersion;
 
 // GitHub's "latest/download/<asset>" URL always redirects to whatever
@@ -4279,6 +4279,10 @@ static bool fetchLatestVersionTag(WiFiClientSecure& client, HTTPClient& http, ch
   http.end();
   if (!http.begin(client, kOtaLatestReleaseUrl)) return false;
   http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+  // A CDN/edge cache can briefly keep serving a stale redirect right after a
+  // new release is published; ask for a fresh answer rather than a cached
+  // one so a just-published release doesn't take a few retries to show up.
+  http.addHeader("Cache-Control", "no-cache");
   const char* headerKeys[] = {"Location"};
   http.collectHeaders(headerKeys, 1);
   int code = http.GET();
@@ -4331,8 +4335,10 @@ static void runOtaUpdate() {
   if (fetchLatestVersionTag(client, http, latestTag, sizeof(latestTag))) {
     Serial.printf("[OTA] installed=%s latest=%s\n", kFirmwareVersion, latestTag);
     if (compareVersions(latestTag, kFirmwareVersion) <= 0) {
+      // Show both versions on screen (not just Serial) since that's what's
+      // actually reachable without a working serial console.
       char msg[32];
-      snprintf(msg, sizeof(msg), "%s is current", kFirmwareVersion);
+      snprintf(msg, sizeof(msg), "Installed %s = %s", kFirmwareVersion, latestTag);
       otaDrawStatus("Already up to date", msg);
       delay(2500);
       return;

@@ -35,13 +35,15 @@
 // TFT_MISO intentionally not defined: MISO is not wired on this board.
 
 // --- SPI speed ---
-// Bumped from a conservative 40MHz: the full 320x240 canvas is pushed over
-// SPI every single frame (no dirty-rect/partial update), so SPI transfer
-// time eats directly into frame budget - raise this first if animation
-// looks choppy. 80MHz is the common ceiling for ST7789 modules; drop back
-// to 40MHz if the screen shows visible corruption/noise instead (a sign the
-// wiring can't handle it).
-#define SPI_FREQUENCY  80000000
+// Was bumped to 80MHz to help a reported animation stutter, but that
+// produced real screen corruption (columns of coloured noise) on this
+// breadboard/jumper-wire wiring - classic signal-integrity failure at high
+// SPI clock on unshielded flying leads, not a software bug. Back to a
+// conservative 40MHz; the dual-core renderer (overlapping SPI transfer with
+// the next frame's drawing) covers most of the performance gain 80MHz was
+// chasing anyway. Only raise this again on a properly soldered/short-wired
+// build, and watch for the same corruption pattern if you do.
+#define SPI_FREQUENCY  40000000
 
 // TFT_eSPI's ESP32-S3 SPI port defaults to `FSPI`, which Arduino-ESP32 core
 // 3.x maps to SPI host 0 - invalid on S3 (only hosts 2/3 exist), causing a
