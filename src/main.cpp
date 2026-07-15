@@ -41,7 +41,7 @@ static void logHeap(const char* where) {
 // Bump this on every release - it's what "Check for Update" compares
 // against the latest GitHub release tag to decide whether there's actually
 // anything newer to download.
-static constexpr const char* kFirmwareVersion = "v1.0.14";
+static constexpr const char* kFirmwareVersion = "v1.0.15";
 static constexpr const char* kSketchVersionLabel = kFirmwareVersion;
 
 // GitHub's "latest/download/<asset>" URL always redirects to whatever
@@ -964,8 +964,16 @@ TFT_eSprite canvas = TFT_eSprite(&tft);
 TFT_eSprite canvas2 = TFT_eSprite(&tft);
 static TFT_eSprite* const frameBuffers[2] = {&canvas, &canvas2};
 static SemaphoreHandle_t bufferFreeSem[2] = {nullptr, nullptr};
-static SemaphoreHandle_t pushRequestSem = nullptr;
-static volatile int pushBufferIndex = 0;
+// Buffer indices to push, handed from core 1 to core 0. A queue (rather
+// than a shared "which index" variable plus a binary semaphore) is
+// required here: if renderFrame() ever produces a second frame before the
+// display task has consumed the first hand-off, giving an
+// already-given binary semaphore is a no-op, silently dropping/
+// overwriting the pending index - the display task then pushes the wrong
+// buffer, the other buffer's bufferFreeSem is never returned, and the next
+// renderFrame() for that buffer hangs forever. A queue can't lose a
+// hand-off like that.
+static QueueHandle_t pushQueue = nullptr;
 static int drawBufferIndex = 0;
 static TaskHandle_t displayTaskHandle = nullptr;
 
@@ -4773,16 +4781,17 @@ void drawSceneLayers(TFT_eSprite& s) {
 //
 // TFT_eSPI's SPI write path (pushPixels) is a tight polling loop with no
 // FreeRTOS yield points of its own. When core 1 keeps this task fed with a
-// new buffer the instant the previous push finishes, xSemaphoreTake never
+// new buffer the instant the previous push finishes, xQueueReceive never
 // actually blocks, so core 0's IDLE0 task (priority 0) never gets scheduled
 // - which starves it long enough to trip the task watchdog. The explicit
 // vTaskDelay(1) guarantees IDLE0 a scheduling window every cycle.
 static void displayTaskFn(void*) {
+  int idx;
   for (;;) {
-    xSemaphoreTake(pushRequestSem, portMAX_DELAY);
-    int idx = pushBufferIndex;
-    frameBuffers[idx]->pushSprite(0, 0);
-    xSemaphoreGive(bufferFreeSem[idx]);
+    if (xQueueReceive(pushQueue, &idx, portMAX_DELAY) == pdTRUE) {
+      frameBuffers[idx]->pushSprite(0, 0);
+      xSemaphoreGive(bufferFreeSem[idx]);
+    }
     vTaskDelay(1);
   }
 }
@@ -4798,8 +4807,8 @@ void renderFrame() {
   applyRenderViewport(s);
   drawSceneLayers(s);
 
-  pushBufferIndex = drawBufferIndex;
-  xSemaphoreGive(pushRequestSem);
+  int idx = drawBufferIndex;
+  xQueueSend(pushQueue, &idx, portMAX_DELAY);
 
   drawBufferIndex ^= 1;
 }
@@ -4841,7 +4850,7 @@ void setup() {
     canvas2.setTextFont(2);
     bufferFreeSem[0] = xSemaphoreCreateBinary();
     bufferFreeSem[1] = xSemaphoreCreateBinary();
-    pushRequestSem = xSemaphoreCreateBinary();
+    pushQueue = xQueueCreate(2, sizeof(int));
     xSemaphoreGive(bufferFreeSem[0]);  // both buffers start out free
     xSemaphoreGive(bufferFreeSem[1]);
     xTaskCreatePinnedToCore(displayTaskFn, "display", 4096, nullptr, 1, &displayTaskHandle, 0);
