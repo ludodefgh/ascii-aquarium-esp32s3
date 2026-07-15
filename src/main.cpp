@@ -41,7 +41,7 @@ static void logHeap(const char* where) {
 // Bump this on every release - it's what "Check for Update" compares
 // against the latest GitHub release tag to decide whether there's actually
 // anything newer to download.
-static constexpr const char* kFirmwareVersion = "v1.0.13";
+static constexpr const char* kFirmwareVersion = "v1.0.14";
 static constexpr const char* kSketchVersionLabel = kFirmwareVersion;
 
 // GitHub's "latest/download/<asset>" URL always redirects to whatever
@@ -4815,8 +4815,6 @@ void setup() {
 
   inputInit();
 
-  ledcAttach(TFT_BL, 5000, 8);
-  applyLcdBrightness();
   tft.init();
   // This ST7789 driver's init sequence sends INVON unconditionally
   // (TFT_Drivers/ST7789_Init.h doesn't actually consult TFT_INVERSION_ON/
@@ -4825,6 +4823,12 @@ void setup() {
   // as white with it left on.
   tft.invertDisplay(false);
   tft.setRotation(1);
+  // tft.init() itself does pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL,
+  // TFT_BACKLIGHT_ON) as part of its own setup - attaching LEDC PWM has to
+  // happen after that or this gets silently undone back to a flat on/off
+  // pin, which is exactly why brightness control had no effect before.
+  ledcAttach(TFT_BL, 5000, 8);
+  applyLcdBrightness();
   tft.fillScreen(BG_COLOR);
   tft.setTextWrap(false);
   tft.setTextFont(2);
