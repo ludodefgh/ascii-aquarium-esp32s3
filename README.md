@@ -28,8 +28,21 @@ No MISO wired (display is write-only).
 - **Push encoder**: feed the fish (home screen) / select or confirm a menu item.
 - **K0**: cycle background style (home screen) / back out of a menu screen.
 
-Settings menu includes fish/bubble/seaweed/creature counts, background style, LCD brightness
-(PWM on the backlight pin), the optional clock, and WiFi/OTA.
+Settings menu includes fish/bubble/seaweed/creature counts, background style, the optional clock,
+and WiFi/OTA. There's a brightness item too, but it currently has no effect - see note below.
+
+### Backlight brightness is currently disabled
+
+Earlier builds drove the backlight with LEDC PWM so the menu's brightness slider actually worked.
+On this breadboard build, that caused genuine screen corruption (columns of coloured noise) after
+10-15s - confirmed by isolating variables one at a time (a real dual-core buffer-hand-off race got
+fixed along the way too, but wasn't the cause of this) down to the PWM switching itself, most
+likely injecting noise onto the shared breadboard power rail into the adjacent SPI lines. SPI at
+80MHz was independently confirmed fine once PWM was off, so it's back on.
+
+The backlight is back to a flat `digitalWrite(TFT_BL, HIGH)` (`setup()` in `src/main.cpp`) and the
+brightness menu item is a no-op for now. Worth retrying PWM on a properly soldered build (less
+breadboard/jumper-wire noise coupling), or at a much lower PWM frequency.
 
 WiFi credentials (for NTP time sync and OTA updates) are entered with an on-screen character
 picker driven by the encoder, since there's no touchscreen keyboard.
