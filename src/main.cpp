@@ -42,7 +42,7 @@ static void logHeap(const char* where) {
 // Bump this on every release - it's what "Check for Update" compares
 // against the latest GitHub release tag to decide whether there's actually
 // anything newer to download.
-static constexpr const char* kFirmwareVersion = "v1.0.19";
+static constexpr const char* kFirmwareVersion = "v1.0.20";
 static constexpr const char* kSketchVersionLabel = kFirmwareVersion;
 
 // GitHub's "latest/download/<asset>" URL always redirects to whatever
@@ -1079,6 +1079,14 @@ unsigned long aquariumNowMs = 0;
 unsigned long fpsTimer = 0;
 unsigned long frameCount = 0;
 float fps = 0.0f;
+
+// Perf debug overlay (menu-toggled). drawMs/pushMs are written by different
+// cores (draw on core 1, push on core 0) and only ever read for display, so
+// plain floats are fine here - no torn reads on this architecture, and a
+// one-frame-stale value on a debug readout is harmless.
+bool debugOverlayEnabled = false;
+float lastDrawMs = 0.0f;
+float lastPushMs = 0.0f;
 
 bool spriteReady = false;
 int mainCanvasActualColorDepth = 0;
@@ -4022,6 +4030,7 @@ enum MenuItemId {
   MENU_WIFI,
   MENU_RESPAWN,
   MENU_RANDOMIZE_FLOWERS,
+  MENU_DEBUG_OVERLAY,
   MENU_EXIT,
   MENU_ITEM_COUNT
 };
@@ -4048,6 +4057,7 @@ static const char* const kMenuLabels[MENU_ITEM_COUNT] = {
     "WiFi...",
     "Respawn Fish",
     "Randomize Flowers",
+    "Debug Overlay",
     "Exit",
 };
 
@@ -4181,6 +4191,9 @@ static void menuFormatValue(MenuItemId id, char* out, size_t cap) {
     case MENU_WIFI:
       copySafe(out, cap, wifiStatusText);
       return;
+    case MENU_DEBUG_OVERLAY:
+      copySafe(out, cap, debugOverlayEnabled ? "On" : "Off");
+      return;
     default:
       out[0] = '\0';
       return;
@@ -4242,6 +4255,9 @@ static void menuAdjustItem(MenuItemId id, int delta) {
       break;
     case MENU_TIMEZONE:
       cycleTimezone(delta);
+      break;
+    case MENU_DEBUG_OVERLAY:
+      debugOverlayEnabled = !debugOverlayEnabled;
       break;
     default:
       break;
@@ -4938,6 +4954,37 @@ static void runRenderPhase(const RenderTask* tasks, int count) {
   }
 }
 
+// Small always-fits-in-a-corner perf readout, menu-toggled ("Debug
+// Overlay"). Shows the two numbers needed to tell which pipeline stage is
+// actually the bottleneck - draw (both cores, task-parallel) vs. push
+// (core 0, SPI-bound) - plus heap headroom, since that's been relevant
+// while chasing the WiFi/OTA issues.
+static void drawDebugOverlay(TFT_eSprite& s) {
+  s.setTextFont(1);
+  s.setTextDatum(TR_DATUM);
+  s.setTextColor(TFT_GREENYELLOW, TFT_BLACK);
+
+  char line[40];
+  int y = 2;
+  const int lineH = 10;
+
+  snprintf(line, sizeof(line), "%.0ffps", fps);
+  s.drawString(line, SCREEN_W - 2, y);
+  y += lineH;
+
+  snprintf(line, sizeof(line), "draw %.1fms", lastDrawMs);
+  s.drawString(line, SCREEN_W - 2, y);
+  y += lineH;
+
+  snprintf(line, sizeof(line), "push %.1fms", lastPushMs);
+  s.drawString(line, SCREEN_W - 2, y);
+  y += lineH;
+
+  snprintf(line, sizeof(line), "heap %uK/%uK", (unsigned)(ESP.getFreeHeap() / 1024UL),
+           (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) / 1024UL));
+  s.drawString(line, SCREEN_W - 2, y);
+}
+
 void renderScenePhased(TFT_eSprite& s) {
   renderTargetSprite = &s;
   renderTSec = aquariumTimeSec();
@@ -5005,16 +5052,10 @@ void renderScenePhased(TFT_eSprite& s) {
     runRenderPhase(&t, 1);
   }
 
-  // Temporary diagnostic readout while chasing a reported stutter in fish
-  // movement - remove once frame timing is confirmed smooth. Runs after
-  // every phase barrier above, so it's the only thing touching the
-  // sprite's shared text state at this point - safe with the stateful API.
-  char fpsText[12];
-  snprintf(fpsText, sizeof(fpsText), "%.0ffps", fps);
-  s.setTextFont(1);
-  s.setTextDatum(TR_DATUM);
-  s.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  s.drawString(fpsText, SCREEN_W - 2, 2);
+  // Debug/perf overlay (menu-toggled). Runs after every phase barrier
+  // above, so it's the only thing touching the sprite's shared text state
+  // at this point - safe with the stateful API.
+  if (debugOverlayEnabled) drawDebugOverlay(s);
 }
 
 // Runs on core 0: waits for a filled buffer, pushes it over SPI (the
@@ -5034,7 +5075,9 @@ static void displayTaskFn(void*) {
   int idx;
   for (;;) {
     if (xQueueReceive(pushQueue, &idx, portMAX_DELAY) == pdTRUE) {
+      unsigned long t0 = micros();
       frameBuffers[idx]->pushSprite(0, 0);
+      lastPushMs = (micros() - t0) / 1000.0f;
       xSemaphoreGive(bufferFreeSem[idx]);
     }
     vTaskDelay(1);
@@ -5063,7 +5106,9 @@ void renderFrame() {
 
   TFT_eSprite& s = *frameBuffers[drawBufferIndex];
   applyRenderViewport(s);
+  unsigned long drawT0 = micros();
   renderScenePhased(s);
+  lastDrawMs = (micros() - drawT0) / 1000.0f;
 
   int idx = drawBufferIndex;
   xQueueSend(pushQueue, &idx, portMAX_DELAY);
