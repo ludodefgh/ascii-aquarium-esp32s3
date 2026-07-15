@@ -35,15 +35,14 @@
 // TFT_MISO intentionally not defined: MISO is not wired on this board.
 
 // --- SPI speed ---
-// Was bumped to 80MHz to help a reported animation stutter, but that
-// produced real screen corruption (columns of coloured noise) on this
-// breadboard/jumper-wire wiring - classic signal-integrity failure at high
-// SPI clock on unshielded flying leads, not a software bug. Back to a
-// conservative 40MHz; the dual-core renderer (overlapping SPI transfer with
-// the next frame's drawing) covers most of the performance gain 80MHz was
-// chasing anyway. Only raise this again on a properly soldered/short-wired
-// build, and watch for the same corruption pattern if you do.
-#define SPI_FREQUENCY  40000000
+// Bumped to 80MHz in v1.0.7, reverted to 40MHz in v1.0.16 while chasing
+// screen corruption - which turned out to be caused by the PWM backlight
+// (v1.0.13) injecting noise onto the shared breadboard power rail, not SPI
+// speed (confirmed in v1.0.17 by disabling PWM alone, at 40MHz, and seeing
+// the corruption disappear). Back to 80MHz now, with PWM backlight still
+// disabled, to confirm SPI speed was never actually a factor. Drop back to
+// 40MHz if corruption reappears with this combination.
+#define SPI_FREQUENCY  80000000
 
 // TFT_eSPI's ESP32-S3 SPI port defaults to `FSPI`, which Arduino-ESP32 core
 // 3.x maps to SPI host 0 - invalid on S3 (only hosts 2/3 exist), causing a

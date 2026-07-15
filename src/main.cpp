@@ -41,7 +41,7 @@ static void logHeap(const char* where) {
 // Bump this on every release - it's what "Check for Update" compares
 // against the latest GitHub release tag to decide whether there's actually
 // anything newer to download.
-static constexpr const char* kFirmwareVersion = "v1.0.17";
+static constexpr const char* kFirmwareVersion = "v1.0.18";
 static constexpr const char* kSketchVersionLabel = kFirmwareVersion;
 
 // GitHub's "latest/download/<asset>" URL always redirects to whatever
