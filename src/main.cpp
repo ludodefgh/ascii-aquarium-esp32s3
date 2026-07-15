@@ -41,7 +41,7 @@ static void logHeap(const char* where) {
 // Bump this on every release - it's what "Check for Update" compares
 // against the latest GitHub release tag to decide whether there's actually
 // anything newer to download.
-static constexpr const char* kFirmwareVersion = "v1.0.16";
+static constexpr const char* kFirmwareVersion = "v1.0.17";
 static constexpr const char* kSketchVersionLabel = kFirmwareVersion;
 
 // GitHub's "latest/download/<asset>" URL always redirects to whatever
@@ -4838,12 +4838,16 @@ void setup() {
   // as white with it left on.
   tft.invertDisplay(false);
   tft.setRotation(1);
-  // tft.init() itself does pinMode(TFT_BL, OUTPUT); digitalWrite(TFT_BL,
-  // TFT_BACKLIGHT_ON) as part of its own setup - attaching LEDC PWM has to
-  // happen after that or this gets silently undone back to a flat on/off
-  // pin, which is exactly why brightness control had no effect before.
-  ledcAttach(TFT_BL, 5000, 8);
-  applyLcdBrightness();
+  // DIAGNOSTIC: LEDC PWM backlight control (added v1.0.13) is disabled here
+  // for now. Screen corruption survived both the buffer-race fix (v1.0.15)
+  // and reverting SPI to 40MHz (v1.0.16), and the user confirmed v1.0.10 -
+  // before PWM backlight existed - never showed this. PWM-switching the
+  // backlight can inject ground-bounce/noise into a shared breadboard power
+  // rail, which is exactly the kind of thing that corrupts an adjacent SPI
+  // bus. Testing with a plain on/off backlight to isolate this; brightness
+  // menu item has no effect while this is disabled.
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
   tft.fillScreen(BG_COLOR);
   tft.setTextWrap(false);
   tft.setTextFont(2);
