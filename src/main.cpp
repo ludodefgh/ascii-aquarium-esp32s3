@@ -17,6 +17,7 @@
 //   EC11  A=4 B=5 PUSH=6
 //   K0    15
 #include <Arduino.h>
+#include <atomic>
 #include <cstring>
 #include <SPI.h>
 #include <Preferences.h>
@@ -41,7 +42,7 @@ static void logHeap(const char* where) {
 // Bump this on every release - it's what "Check for Update" compares
 // against the latest GitHub release tag to decide whether there's actually
 // anything newer to download.
-static constexpr const char* kFirmwareVersion = "v1.0.18";
+static constexpr const char* kFirmwareVersion = "v1.0.19";
 static constexpr const char* kSketchVersionLabel = kFirmwareVersion;
 
 // GitHub's "latest/download/<asset>" URL always redirects to whatever
@@ -3546,26 +3547,37 @@ void drawSeaweedBranches(TFT_eSprite& s, int bladeIndex, float bladeHeight, floa
   }
 }
 
-void drawSeaweed(TFT_eSprite& s, float tSec) {
-  static const int roots = 12;
-  static bool cached = false;
-  static float baseX[roots];
-  static float amp[roots];
-  static float heightNoise[roots];
+// Root parameters used to be lazily cached function-local statics inside
+// drawSeaweed(); pulled out to file scope and explicitly initialised once at
+// boot (initSeaweedCache(), called from setup()) so multiple concurrent
+// render-task-queue workers can safely call drawSeaweedRange() without a
+// race on first-time cache population.
+static const int kSeaweedRoots = 12;
+static float seaweedBaseX[kSeaweedRoots];
+static float seaweedAmp[kSeaweedRoots];
+static float seaweedHeightNoise[kSeaweedRoots];
 
-  if (!cached) {
-    for (int i = 0; i < roots; ++i) {
-      baseX[i] = 10 + i * (SCREEN_W - 20.0f) / (roots - 1);
-      amp[i] = 5.0f + (i % 4) * 2.0f;
-      heightNoise[i] = sinf(i * 2.173f + 0.61f);
-    }
-    cached = true;
+static void initSeaweedCache() {
+  for (int i = 0; i < kSeaweedRoots; ++i) {
+    seaweedBaseX[i] = 10 + i * (SCREEN_W - 20.0f) / (kSeaweedRoots - 1);
+    seaweedAmp[i] = 5.0f + (i % 4) * 2.0f;
+    seaweedHeightNoise[i] = sinf(i * 2.173f + 0.61f);
   }
+}
 
-  for (int i = 0; i < roots; i++) {
-    float bx = baseX[i];
-    float sway = wrappedSinf(tSec * (0.8f + 0.09f * i) * seaweedSwaySpeed + i * 0.7f) * amp[i];
-    float heightVariation = 1.0f + seaweedLengthRandomness * heightNoise[i];
+// Draws seaweed blades [start, start+count). Safe to call concurrently from
+// multiple cores for disjoint ranges: drawLine()/drawSeaweedBranches() take
+// colour as an explicit argument rather than TFT_eSprite's shared
+// textcolor state, so there's no data race - at worst, two blades whose
+// branch tips happen to touch on screen get a harmless "last write wins"
+// pixel, not corruption.
+void drawSeaweedRange(TFT_eSprite& s, float tSec, int start, int count) {
+  int end = start + count;
+  if (end > kSeaweedRoots) end = kSeaweedRoots;
+  for (int i = start; i < end; i++) {
+    float bx = seaweedBaseX[i];
+    float sway = wrappedSinf(tSec * (0.8f + 0.09f * i) * seaweedSwaySpeed + i * 0.7f) * seaweedAmp[i];
+    float heightVariation = 1.0f + seaweedLengthRandomness * seaweedHeightNoise[i];
     float bladeHeight = clampVal(32.0f * seaweedLength * heightVariation, 18.0f, 72.0f);
     int y0 = SCREEN_H - 2;
 
@@ -3589,36 +3601,104 @@ void drawSeaweed(TFT_eSprite& s, float tSec) {
   }
 }
 
-void drawFlakes(TFT_eSprite& s) {
-  s.setTextSize(1);
-  s.setTextDatum(MC_DATUM);
-  for (int i = 0; i < MAX_FLAKES; i++) {
+void drawSeaweed(TFT_eSprite& s, float tSec) {
+  drawSeaweedRange(s, tSec, 0, kSeaweedRoots);
+}
+
+// ---- Thread-safe Font 2 character blit -------------------------------------
+// Fish/bubbles/flakes are drawn with per-entity colour via
+// TFT_eSprite::setTextColor()+drawChar(), but setTextColor() writes shared
+// mutable state (textcolor/textbgcolor) on the *sprite object itself* - two
+// cores drawing different-coloured entities concurrently on the same sprite
+// would race on that shared state (one core's colour can stomp the other's
+// between its setTextColor() and drawChar() calls). This reimplements the
+// exact bit-blit TFT_eSPI itself uses for Font 2 in transparent-background,
+// size-1 mode (TFT_eSPI.cpp's drawChar(uniCode,x,y,font), the font==2
+// branch) but takes colour as an explicit per-call argument and writes
+// straight into the sprite's raw pixel buffer, so it has no shared state to
+// race on. Safe to call concurrently from multiple cores as long as two
+// calls never target the *same* pixel at the same instant (harmless
+// "last write wins" if they ever do - fish/bubbles are small and sparse
+// enough that this is not worth guarding against).
+static void directDrawCharFont2(uint16_t* buf, int x, int y, char c, uint16_t color) {
+  if (c < 32 || c > 127) return;
+  int uni = (int)(unsigned char)c - 32;
+  uint32_t flash_address = pgm_read_dword(&chrtbl_f16[uni]);
+  int width = pgm_read_byte(widtbl_f16 + uni);
+  int height = chr_hgt_f16;
+  int w = (width + 6) / 8;
+  for (int i = 0; i < height; ++i) {
+    int py = y + i;
+    if (py < 0 || py >= SCREEN_H) continue;
+    for (int k = 0; k < w; ++k) {
+      uint8_t line = pgm_read_byte((const uint8_t*)flash_address + w * i + k);
+      if (!line) continue;
+      int pxBase = x + k * 8;
+      uint8_t mask = 0x80;
+      for (int bit = 0; bit < 8; ++bit) {
+        if (line & mask) {
+          int px = pxBase + bit;
+          if (px >= 0 && px < SCREEN_W) buf[py * SCREEN_W + px] = color;
+        }
+        mask >>= 1;
+      }
+    }
+  }
+}
+
+// 'o' and '*' widths in Font 2, cached once at boot (initEntityGlyphMetrics)
+// to reproduce drawString()'s MC_DATUM centring (poX -= width/2, poY -=
+// height/2) without calling the (shared-state) textWidth()/drawString() API.
+static int16_t bubbleGlyphWidth = 0;
+static int16_t flakeGlyphWidth = 0;
+
+static void initEntityGlyphMetrics() {
+  bubbleGlyphWidth = pgm_read_byte(widtbl_f16 + ((unsigned char)'o' - 32));
+  flakeGlyphWidth = pgm_read_byte(widtbl_f16 + ((unsigned char)'*' - 32));
+}
+
+void drawFlakesRange(TFT_eSprite& s, int start, int count) {
+  uint16_t* buf = (uint16_t*)s.getPointer();
+  int end = start + count;
+  if (end > MAX_FLAKES) end = MAX_FLAKES;
+  for (int i = start; i < end; i++) {
     if (!flakes[i].active) continue;
-    s.setTextColor(flakes[i].color);
-    s.drawString("*", (int)flakes[i].x, (int)flakes[i].y);
+    int x = (int)flakes[i].x - flakeGlyphWidth / 2;
+    int y = (int)flakes[i].y - chr_hgt_f16 / 2;
+    directDrawCharFont2(buf, x, y, '*', flakes[i].color);
+  }
+}
+
+void drawFlakes(TFT_eSprite& s) {
+  drawFlakesRange(s, 0, MAX_FLAKES);
+}
+
+void drawBubblesRange(TFT_eSprite& s, int start, int count) {
+  uint16_t* buf = (uint16_t*)s.getPointer();
+  int bubbleCount = activeBubbleLimit();
+  int end = start + count;
+  if (end > bubbleCount) end = bubbleCount;
+  for (int i = start; i < end; i++) {
+    if (!bubbles[i].active) continue;
+    int x = (int)bubbles[i].x - bubbleGlyphWidth / 2;
+    int y = (int)bubbles[i].y - chr_hgt_f16 / 2;
+    directDrawCharFont2(buf, x, y, 'o', bubbles[i].color);
   }
 }
 
 void drawBubbles(TFT_eSprite& s) {
-  s.setTextSize(1);
-  s.setTextDatum(MC_DATUM);
-  int bubbleCount = activeBubbleLimit();
-  for (int i = 0; i < bubbleCount; i++) {
-    if (!bubbles[i].active) continue;
-    s.setTextColor(bubbles[i].color);
-    s.drawString("o", (int)bubbles[i].x, (int)bubbles[i].y);
-  }
+  drawBubblesRange(s, 0, activeBubbleLimit());
 }
 
-void drawFish(TFT_eSprite& s) {
-  s.setTextSize(1);
-  s.setTextDatum(TL_DATUM);
-  const float t = aquariumTimeSec();
-  const float waveBase = t * FISH_SWIM_WAVE_SPEED;
+void drawFishRange(TFT_eSprite& s, float tSec, int start, int count) {
+  uint16_t* buf = (uint16_t*)s.getPointer();
+  const float waveBase = tSec * FISH_SWIM_WAVE_SPEED;
   static const float waveStepSin = sinf(FISH_SWIM_WAVE_SPACING);
   static const float waveStepCos = cosf(FISH_SWIM_WAVE_SPACING);
   int fishCount = activeFishLimit();
-  for (int i = 0; i < fishCount; i++) {
+  int end = start + count;
+  if (end > fishCount) end = fishCount;
+  for (int i = start; i < end; i++) {
     Fish& f = fishPool[i];
     if (!f.active) continue;
     const char* txt = fishGlyphDrawing(f);
@@ -3627,13 +3707,12 @@ void drawFish(TFT_eSprite& s) {
     float waveAngle = waveBase + f.phase;
     float wave = sinf(waveAngle);
     float waveCos = cosf(waveAngle);
-    s.setTextColor(f.renderColor);
     for (uint8_t c = 0; c < len; ++c) {
       if (txt[c] != ' ') {
         float yOffset = wave * FISH_SWIM_WAVE_AMPLITUDE;
         int charX = (int)f.x + glyphOffsets[c];
         int charY = (int)f.y + (int)(yOffset + ((yOffset >= 0.0f) ? 0.5f : -0.5f));
-        s.drawChar((uint16_t)txt[c], charX, charY);
+        directDrawCharFont2(buf, charX, charY, txt[c], f.renderColor);
       }
 
       float nextWave = wave * waveStepCos + waveCos * waveStepSin;
@@ -3641,6 +3720,10 @@ void drawFish(TFT_eSprite& s) {
       wave = nextWave;
     }
   }
+}
+
+void drawFish(TFT_eSprite& s) {
+  drawFishRange(s, aquariumTimeSec(), 0, activeFishLimit());
 }
 
 uint16_t octopusColor(float tSec) {
@@ -4755,23 +4838,177 @@ void drawMenuOverlay(TFT_eSprite& s) {
 
 // ===== part: new_scene =====
 // ------------------------------ Scene composition -----------------------------
-void drawSceneLayers(TFT_eSprite& s) {
-  float tSec = aquariumTimeSec();
-  drawBackground(s, tSec);
-  drawAsciiClockBackground(s);
-  drawSnail(s);
-  drawSeaweed(s, tSec);
-  drawBubbles(s);
-  drawFlakes(s);
-  drawFish(s);
-  drawJellyfish(s);
-  drawOctopus(s);
-  drawSeahorse(s);
-  drawClock(s);
-  drawMenuOverlay(s);
+// Rendering is split into small tasks pulled from a shared queue by two
+// workers: core 1 (the Arduino loop, inline) and a dedicated draw-worker
+// task on core 0. Tasks are grouped into phases that match the original
+// fixed draw order (background -> seaweed -> bubbles -> flakes -> fish ->
+// visitors -> clock/menu), with a barrier between phases so a later layer
+// can never race ahead and draw before an earlier one - each phase's tasks
+// must all finish before the next phase's tasks are enqueued. Within a
+// phase, multi-entity layers (seaweed/bubbles/fish) are split into index
+// ranges across a handful of tasks so the two workers can drain them in
+// parallel; single-entity layers (background, visitors, overlay) are just
+// one task, since there's nothing to split.
+//
+// Core 0 has two tasks: this draw-worker (lower priority) and the existing
+// SPI-push task (higher priority, unchanged). Whenever a finished buffer is
+// ready to push, FreeRTOS preempts the draw-worker to run the push
+// immediately - they're never fighting over the *same* buffer (the push
+// task only ever pushes an already-fully-drawn buffer from a previous
+// renderFrame() call), so this is safe and keeps push latency unaffected.
+enum RenderTaskKind : uint8_t {
+  RT_BACKGROUND,  // background + ascii-clock-bg + snail (single task)
+  RT_SEAWEED,
+  RT_BUBBLES,
+  RT_FLAKES,
+  RT_FISH,
+  RT_VISITORS,  // jellyfish + octopus + seahorse (single task)
+  RT_OVERLAY,   // clock + menu overlay (single task, must run last)
+};
+
+struct RenderTask {
+  RenderTaskKind kind;
+  int16_t start;
+  int16_t count;
+};
+
+static QueueHandle_t renderTaskQueue = nullptr;
+static std::atomic<int> renderTasksPending{0};
+static TFT_eSprite* renderTargetSprite = nullptr;
+static float renderTSec = 0.0f;
+
+static void executeRenderTask(const RenderTask& t) {
+  TFT_eSprite& s = *renderTargetSprite;
+  switch (t.kind) {
+    case RT_BACKGROUND:
+      drawBackground(s, renderTSec);
+      drawAsciiClockBackground(s);
+      drawSnail(s);
+      break;
+    case RT_SEAWEED:
+      drawSeaweedRange(s, renderTSec, t.start, t.count);
+      break;
+    case RT_BUBBLES:
+      drawBubblesRange(s, t.start, t.count);
+      break;
+    case RT_FLAKES:
+      drawFlakesRange(s, t.start, t.count);
+      break;
+    case RT_FISH:
+      drawFishRange(s, renderTSec, t.start, t.count);
+      break;
+    case RT_VISITORS:
+      drawJellyfish(s);
+      drawOctopus(s);
+      drawSeahorse(s);
+      break;
+    case RT_OVERLAY:
+      drawClock(s);
+      drawMenuOverlay(s);
+      break;
+  }
+}
+
+// Splits `total` items into `chunks` index ranges as evenly as possible.
+static void splitIntoChunks(int total, int chunks, int chunkIndex, int& start, int& count) {
+  int base = total / chunks;
+  int rem = total % chunks;
+  start = chunkIndex * base + (chunkIndex < rem ? chunkIndex : rem);
+  count = base + (chunkIndex < rem ? 1 : 0);
+}
+
+// Enqueues one phase's tasks, then helps drain the queue on the calling
+// core (core 1) until every task in the phase - across both workers - has
+// actually finished executing. This is the barrier: the next phase isn't
+// enqueued until this returns.
+static void runRenderPhase(const RenderTask* tasks, int count) {
+  if (count <= 0) return;
+  renderTasksPending.store(count, std::memory_order_release);
+  for (int i = 0; i < count; ++i) {
+    xQueueSend(renderTaskQueue, &tasks[i], portMAX_DELAY);
+  }
+  RenderTask t;
+  while (renderTasksPending.load(std::memory_order_acquire) > 0) {
+    if (xQueueReceive(renderTaskQueue, &t, 0) == pdTRUE) {
+      executeRenderTask(t);
+      renderTasksPending.fetch_sub(1, std::memory_order_acq_rel);
+    } else {
+      taskYIELD();
+    }
+  }
+}
+
+void renderScenePhased(TFT_eSprite& s) {
+  renderTargetSprite = &s;
+  renderTSec = aquariumTimeSec();
+
+  {
+    RenderTask t{RT_BACKGROUND, 0, 0};
+    runRenderPhase(&t, 1);
+  }
+  {
+    static const int kTasks = 4;
+    RenderTask tasks[kTasks];
+    int n = 0;
+    for (int i = 0; i < kTasks; ++i) {
+      int start, count;
+      splitIntoChunks(kSeaweedRoots, kTasks, i, start, count);
+      if (count > 0) tasks[n++] = RenderTask{RT_SEAWEED, (int16_t)start, (int16_t)count};
+    }
+    runRenderPhase(tasks, n);
+  }
+  {
+    static const int kTasks = 4;
+    int bubbleCount = activeBubbleLimit();
+    RenderTask tasks[kTasks];
+    int n = 0;
+    if (bubbleCount > 0) {
+      for (int i = 0; i < kTasks; ++i) {
+        int start, count;
+        splitIntoChunks(bubbleCount, kTasks, i, start, count);
+        if (count > 0) tasks[n++] = RenderTask{RT_BUBBLES, (int16_t)start, (int16_t)count};
+      }
+    }
+    runRenderPhase(tasks, n);
+  }
+  {
+    static const int kTasks = 2;
+    RenderTask tasks[kTasks];
+    int n = 0;
+    for (int i = 0; i < kTasks; ++i) {
+      int start, count;
+      splitIntoChunks(MAX_FLAKES, kTasks, i, start, count);
+      if (count > 0) tasks[n++] = RenderTask{RT_FLAKES, (int16_t)start, (int16_t)count};
+    }
+    runRenderPhase(tasks, n);
+  }
+  {
+    static const int kTasks = 4;
+    int fishCount = activeFishLimit();
+    RenderTask tasks[kTasks];
+    int n = 0;
+    if (fishCount > 0) {
+      for (int i = 0; i < kTasks; ++i) {
+        int start, count;
+        splitIntoChunks(fishCount, kTasks, i, start, count);
+        if (count > 0) tasks[n++] = RenderTask{RT_FISH, (int16_t)start, (int16_t)count};
+      }
+    }
+    runRenderPhase(tasks, n);
+  }
+  {
+    RenderTask t{RT_VISITORS, 0, 0};
+    runRenderPhase(&t, 1);
+  }
+  {
+    RenderTask t{RT_OVERLAY, 0, 0};
+    runRenderPhase(&t, 1);
+  }
 
   // Temporary diagnostic readout while chasing a reported stutter in fish
-  // movement - remove once frame timing is confirmed smooth.
+  // movement - remove once frame timing is confirmed smooth. Runs after
+  // every phase barrier above, so it's the only thing touching the
+  // sprite's shared text state at this point - safe with the stateful API.
   char fpsText[12];
   snprintf(fpsText, sizeof(fpsText), "%.0ffps", fps);
   s.setTextFont(1);
@@ -4784,6 +5021,8 @@ void drawSceneLayers(TFT_eSprite& s) {
 // blocking part), then frees that buffer for reuse. Pinning this to the
 // core the Arduino loop() doesn't run on lets that blocking SPI push
 // happen concurrently with the next frame's physics/drawing on core 1.
+// Higher priority than drawWorkerTaskFn so it always preempts drawing help
+// the instant a buffer is ready to push.
 //
 // TFT_eSPI's SPI write path (pushPixels) is a tight polling loop with no
 // FreeRTOS yield points of its own. When core 1 keeps this task fed with a
@@ -4802,6 +5041,19 @@ static void displayTaskFn(void*) {
   }
 }
 
+// Runs on core 0 alongside displayTaskFn (lower priority): picks up
+// render-phase tasks whenever it isn't preempted by a pending push.
+static void drawWorkerTaskFn(void*) {
+  RenderTask t;
+  for (;;) {
+    if (xQueueReceive(renderTaskQueue, &t, portMAX_DELAY) == pdTRUE) {
+      executeRenderTask(t);
+      renderTasksPending.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    vTaskDelay(1);
+  }
+}
+
 void renderFrame() {
   if (!spriteReady) return;
 
@@ -4811,7 +5063,7 @@ void renderFrame() {
 
   TFT_eSprite& s = *frameBuffers[drawBufferIndex];
   applyRenderViewport(s);
-  drawSceneLayers(s);
+  renderScenePhased(s);
 
   int idx = drawBufferIndex;
   xQueueSend(pushQueue, &idx, portMAX_DELAY);
@@ -4861,9 +5113,14 @@ void setup() {
     bufferFreeSem[0] = xSemaphoreCreateBinary();
     bufferFreeSem[1] = xSemaphoreCreateBinary();
     pushQueue = xQueueCreate(2, sizeof(int));
+    renderTaskQueue = xQueueCreate(16, sizeof(RenderTask));
     xSemaphoreGive(bufferFreeSem[0]);  // both buffers start out free
     xSemaphoreGive(bufferFreeSem[1]);
-    xTaskCreatePinnedToCore(displayTaskFn, "display", 4096, nullptr, 1, &displayTaskHandle, 0);
+    // Priority 2 for the push task, 1 for the draw-worker: whenever a
+    // buffer is ready to push, it always preempts core 0 helping draw the
+    // next frame (see renderScenePhased()'s comment for why that's safe).
+    xTaskCreatePinnedToCore(displayTaskFn, "display", 4096, nullptr, 2, &displayTaskHandle, 0);
+    xTaskCreatePinnedToCore(drawWorkerTaskFn, "drawWorker", 4096, nullptr, 1, nullptr, 0);
     allocateGradientBandCache();
     tft.setCursor(10, 28);
     tft.setTextColor(TFT_CYAN, BG_COLOR);
@@ -4900,6 +5157,8 @@ void setup() {
   jellyfish.nextSpawnMs = 0;
   initFishMirrors();
   initFishGlyphMetrics();
+  initSeaweedCache();
+  initEntityGlyphMetrics();
   applyFishPopulation();
   spreadInitialFishLayout();
   applyBubblePopulation(true);

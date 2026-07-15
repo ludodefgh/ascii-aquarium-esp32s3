@@ -58,9 +58,28 @@ control — none of that hardware exists on this board.
 
 ## Performance
 
-The scene renders into one of two sprite buffers (both allocated in PSRAM); a task pinned to core
-0 pushes the finished buffer over SPI while core 1 (the normal `loop()`) draws the next frame into
-the other buffer, so SPI transfer time overlaps with drawing/physics instead of blocking it.
+Two layers of parallelism across the S3's two cores:
+
+- **Double-buffered push**: the scene renders into one of two sprite buffers (both in PSRAM); a
+  task on core 0 pushes the finished buffer over SPI while core 1 (`loop()`) draws the next frame
+  into the other buffer, overlapping SPI transfer with drawing/physics instead of blocking on it.
+- **Task-parallel drawing**: within a frame, drawing is split into small tasks pulled from a shared
+  queue by core 1 (inline, between physics updates) and a second core-0 task. Tasks are grouped
+  into phases matching the original fixed draw order (background → seaweed → bubbles → flakes →
+  fish → visitors → clock/menu) with a barrier between phases, so layers still composite in the
+  right order; within a phase, multi-entity layers (seaweed/bubbles/fish) are split into index
+  ranges so both cores can drain them concurrently. Core 0's draw-helper task runs at lower
+  priority than its SPI-push task, so a buffer that's ready to display always preempts it.
+  Entities are *not* clustered by on-screen overlap - two same-phase entities that happen to
+  overlap on screen could rarely have their draw order flip between cores, a harmless one-frame
+  z-order flicker, not corruption.
+  - Fish/bubbles/flakes are drawn with a custom thread-safe Font 2 character blitter
+    (`directDrawCharFont2` in `src/main.cpp`) that writes straight into the sprite's raw pixel
+    buffer with colour as an explicit argument, rather than TFT_eSprite's normal
+    `setTextColor()`+`drawChar()`, which store the current colour as shared mutable state on the
+    sprite object - unsafe if two cores are drawing different-coloured entities on it at once.
+  - Seaweed uses TFT_eSprite's own `drawLine()` directly (already colour-explicit/stateless, no
+    reimplementation needed).
 
 ## OTA updates
 
