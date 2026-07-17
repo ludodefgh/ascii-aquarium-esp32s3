@@ -39,9 +39,16 @@
 // screen corruption - which turned out to be caused by the PWM backlight
 // (v1.0.13) injecting noise onto the shared breadboard power rail, not SPI
 // speed (confirmed in v1.0.17 by disabling PWM alone, at 40MHz, and seeing
-// the corruption disappear). Back to 80MHz now, with PWM backlight still
-// disabled, to confirm SPI speed was never actually a factor. Drop back to
-// 40MHz if corruption reappears with this combination.
+// the corruption disappear). Back to 80MHz for a while after that.
+//
+// Dropped to 40MHz in v1.0.33 while stabilising the DMA push path (see
+// TFT_eSPI_ESP32_S3.c's dma_end_callback and scripts/patch_tft_espi_dma.py):
+// the SPI_DMA_CONF_REG workaround fixed the "frozen after first frame" DMA
+// bug, but at 80MHz it was still intermittent on this breadboard build.
+// Back to 80MHz in v1.0.35 after fixing the power supply (was drawing
+// current through a phone's USB port; now powered properly) - worth
+// retrying since the earlier instability may have been power, not SPI
+// signal margin. Drop back to 40MHz if DMA degrades into noise again.
 #define SPI_FREQUENCY  80000000
 
 // TFT_eSPI's ESP32-S3 SPI port defaults to `FSPI`, which Arduino-ESP32 core

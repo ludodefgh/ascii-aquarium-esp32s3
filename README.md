@@ -31,18 +31,21 @@ No MISO wired (display is write-only).
 Settings menu includes fish/bubble/seaweed/creature counts, background style, the optional clock,
 and WiFi/OTA. There's a brightness item too, but it currently has no effect - see note below.
 
-### Backlight brightness is currently disabled
+### Backlight brightness
 
 Earlier builds drove the backlight with LEDC PWM so the menu's brightness slider actually worked.
 On this breadboard build, that caused genuine screen corruption (columns of coloured noise) after
 10-15s - confirmed by isolating variables one at a time (a real dual-core buffer-hand-off race got
 fixed along the way too, but wasn't the cause of this) down to the PWM switching itself, most
 likely injecting noise onto the shared breadboard power rail into the adjacent SPI lines. SPI at
-80MHz was independently confirmed fine once PWM was off, so it's back on.
+80MHz was independently confirmed fine once PWM was off, so brightness was left disabled (flat
+`digitalWrite(TFT_BL, HIGH)`) for several releases while other things were fixed.
 
-The backlight is back to a flat `digitalWrite(TFT_BL, HIGH)` (`setup()` in `src/main.cpp`) and the
-brightness menu item is a no-op for now. Worth retrying PWM on a properly soldered build (less
-breadboard/jumper-wire noise coupling), or at a much lower PWM frequency.
+Re-enabled in v1.0.38 (`ledcAttach(TFT_BL, 5000, 8)` + `applyLcdBrightness()` in `setup()`, after
+`tft.init()` which otherwise resets the pin to a plain digital output) now that the board is
+powered properly instead of drawing through a phone's USB port - the earlier corruption may well
+have been that marginal supply rather than PWM itself. Revert to the plain `digitalWrite` if
+corruption reappears.
 
 WiFi credentials (for NTP time sync and OTA updates) are entered with an on-screen character
 picker driven by the encoder, since there's no touchscreen keyboard.
@@ -58,7 +61,49 @@ control — none of that hardware exists on this board.
 
 ## Performance
 
-Two layers of parallelism across the S3's two cores:
+A toggleable debug overlay (menu → "Debug Overlay") shows FPS, draw time, push
+time, and free heap - useful for judging the effect of any of this.
+
+Three layers of parallelism/optimisation:
+
+- **DMA push in bands**: TFT_eSPI's non-DMA SPI write pokes the SPI
+  peripheral's 32-pixel hardware FIFO directly; on the S3 each of the ~2400
+  refills needed for a full frame requires an extra register "update"
+  handshake the S3's SPI peripheral imposes, which measured ~2.6x the
+  theoretical transfer time at 80MHz (40ms actual vs ~15ms theoretical for a
+  320x240x16bpp frame). Pushing over DMA instead, in 48-row bands (kept under
+  TFT_eSPI's 16384px per-call DMA threshold - `displayTaskFn` in
+  `src/main.cpp`), hands each band to the SPI peripheral as one transfer
+  instead of ~480 tiny CPU-driven ones.
+  - Getting DMA working at all needed a **patch to the vendored TFT_eSPI
+    copy** (`.pio/libdeps/*/TFT_eSPI/Processors/TFT_eSPI_ESP32_S3.c`, not
+    part of this repo - PlatformIO re-fetches it fresh, so this patch has
+    to be re-applied after any clean `lib_deps` reinstall): a known
+    ESP32-S3 TFT_eSPI bug where the display freezes after the very first
+    DMA transaction while software keeps reporting success on every one
+    after that (see
+    [Bodmer/TFT_eSPI#2233](https://github.com/Bodmer/TFT_eSPI/discussions/2233),
+    [#3414](https://github.com/Bodmer/TFT_eSPI/issues/3414),
+    [#3432](https://github.com/Bodmer/TFT_eSPI/discussions/3432)).
+    `dma_end_callback` needs to write `0b11` (not `0`) to
+    `SPI_DMA_CONF_REG`, indexed by `SPI_DMA_CH_AUTO` rather than
+    `spi_host` - those are different index spaces, and the original code
+    (indexed by `spi_host`) clears the wrong copy of the register. Briefly
+    needed dropping `SPI_FREQUENCY` to 40MHz while a marginal power supply
+    (USB current through a phone) made it flaky at 80MHz; back to 80MHz
+    (see `User_Setup.h`) now that the board is powered properly.
+  - Non-black backgrounds (gradient sky styles) used to cost noticeably
+    more draw time than flat black - partly because every gradient row was
+    being written twice (a full-width flat-colour fill, then immediately
+    overwritten by the cached gradient). Each row-chunk now only fills the
+    part *below* the gradient, and only pushes the cached gradient rows it
+    actually overlaps - no more double-write. Tried also extending the
+    cache to the *whole* screen (baking the flat colour in too, to avoid
+    the separate fill entirely) but that was a net regression: it turned a
+    cheap fillRect (writes one row, then memcpy's that small, cache-resident
+    row repeatedly) into a genuine PSRAM read per row from a ~150KB cache
+    that doesn't fit in CPU cache - reverted, gradientBandCache only holds
+    the gradient band itself.
 
 - **Double-buffered push**: the scene renders into one of two sprite buffers (both in PSRAM); a
   task on core 0 pushes the finished buffer over SPI while core 1 (`loop()`) draws the next frame
@@ -85,11 +130,13 @@ Two layers of parallelism across the S3's two cores:
 
 WiFi menu → "Check for Update" first does a cheap redirect-only request to learn the latest
 release's tag and compares it against the running firmware's version (shown just below the WiFi
-status line in that same menu) — if there's nothing newer, it says so and skips the download
-entirely. Otherwise it downloads the `firmware.bin` asset from this repo's latest release and
-flashes it to the inactive OTA partition (`Update.h`) before rebooting — no cable needed after the
-first flash. It only touches the OTA app partition, never NVS, so WiFi credentials and tank
-settings survive an update.
+status line in that same menu) — if there's nothing newer, it shows both version numbers with an
+"OK" / "Force Update" choice (rotate to pick, push to confirm) instead of just bailing out, so you
+can re-flash the exact same version over the air (e.g. to recover from a bad flash) without a
+cable. Otherwise it downloads the `firmware.bin` asset from this repo's latest release and flashes
+it to the inactive OTA partition (`Update.h`) before rebooting — no cable needed after the first
+flash. It only touches the OTA app partition, never NVS, so WiFi credentials and tank settings
+survive an update.
 
 **Remember to bump `kFirmwareVersion` in `src/main.cpp`** before tagging a new release — that's the
 value the version check compares against.

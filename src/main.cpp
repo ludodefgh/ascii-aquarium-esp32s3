@@ -42,7 +42,7 @@ static void logHeap(const char* where) {
 // Bump this on every release - it's what "Check for Update" compares
 // against the latest GitHub release tag to decide whether there's actually
 // anything newer to download.
-static constexpr const char* kFirmwareVersion = "v1.0.20";
+static constexpr const char* kFirmwareVersion = "v1.0.47";
 static constexpr const char* kSketchVersionLabel = kFirmwareVersion;
 
 // GitHub's "latest/download/<asset>" URL always redirects to whatever
@@ -977,6 +977,42 @@ static SemaphoreHandle_t bufferFreeSem[2] = {nullptr, nullptr};
 static QueueHandle_t pushQueue = nullptr;
 static int drawBufferIndex = 0;
 static TaskHandle_t displayTaskHandle = nullptr;
+
+// Set while a full-screen dialog (OTA progress/prompts) is drawing
+// directly on tft, bypassing the sprite/canvas + DMA push pipeline
+// entirely (see otaDrawStatus's comment). loop() skips renderFrame() while
+// this is set - physics/simulation state still updates normally, only the
+// draw+push is paused - so the display task's async DMA transfers can
+// never be in flight at the same time as those direct writes, which share
+// the same physical SPI bus/peripheral.
+static bool suspendSceneRender = false;
+
+// Blocks until both frame buffers are simultaneously free, i.e. the
+// display task has finished pushing everything that was already queued
+// and is idle. Safe to call right after setting suspendSceneRender = true:
+// with renderFrame() no longer running, nothing else takes these
+// semaphores, so once both are seen free they stay free.
+static void waitForRenderPipelineIdle() {
+  for (int i = 0; i < 2; ++i) {
+    if (xSemaphoreTake(bufferFreeSem[i], pdMS_TO_TICKS(500)) == pdTRUE) {
+      xSemaphoreGive(bufferFreeSem[i]);
+    }
+  }
+}
+
+// RAII guard: pauses scene rendering for the lifetime of the object,
+// resuming on any exit path (including early returns) once it goes out of
+// scope. Construct one at the top of any function that draws full-screen
+// content directly on tft.
+struct ScopedRenderSuspend {
+  ScopedRenderSuspend() {
+    suspendSceneRender = true;
+    waitForRenderPipelineIdle();
+  }
+  ~ScopedRenderSuspend() {
+    suspendSceneRender = false;
+  }
+};
 
 Preferences prefs;
 
@@ -2067,6 +2103,15 @@ void drawVerticalGradientStops(TFT_eSprite& s, const uint16_t* colors, const uin
   }
 }
 
+// Only caches the gradient band itself (BACKGROUND_GRADIENT_H rows), not
+// the whole screen - tried a full-screen cache once (baking the flat
+// BG_COLOR rows below the gradient in here too, avoiding a separate
+// fillRect) but that was a net regression: fillRect's 16bpp path writes one
+// row manually then memcpy's *that* small, cache-resident row repeatedly,
+// which is fast; reading the flat rows from a 150KB PSRAM cache instead
+// turned that into a genuine PSRAM read per row, slower despite doing less
+// total work on paper. Keep the cache small (just the part that actually
+// varies per-row) and let fillRect handle the flat part.
 void buildGradientBandCache(const uint16_t* colors, const uint8_t* stops, int stopCount, int ditherPattern, int ditherScale,
                             int ditherAmplitude) {
   if (gradientBandCache == nullptr) return;
@@ -2093,21 +2138,74 @@ void drawTopGradientBackground(TFT_eSprite& s, uint16_t topColor, int ditherPatt
                             ditherAmplitude);
 }
 
+void drawBackground(TFT_eSprite& s, float tSec);
+
+// Ensures gradientBandCache holds the current style/colour's gradient,
+// rebuilding it if needed. Must be called once, serially, before any
+// parallel drawBackgroundRange() task runs below - two cores racing to
+// rebuild the same cache would be a real race, not just wasted work.
+void ensureBackgroundGradientCacheCurrent() {
+  if (gradientBandCache == nullptr) return;
+  if (backgroundStyle != BACKGROUND_STYLE_DITHERED && backgroundStyle != BACKGROUND_STYLE_SMOOTH) return;
+
+  uint16_t topColor = activeBackgroundGradientColor();
+  if (gradientBandCacheStyle == backgroundStyle && gradientBandCacheColor == topColor) return;
+
+  int ditherPattern = (backgroundStyle == BACKGROUND_STYLE_DITHERED) ? GRADIENT_DITHER_ORDERED : GRADIENT_DITHER_NONE;
+  int ditherScale = (backgroundStyle == BACKGROUND_STYLE_DITHERED) ? 4 : 1;
+  int ditherAmplitude = (backgroundStyle == BACKGROUND_STYLE_DITHERED) ? 28 : 0;
+  buildGradientColorsFromTop(topColor, activeGradientColors, kGradientStopCount);
+  buildGradientBandCache(activeGradientColors, kGradientStops, kGradientStopCount, ditherPattern, ditherScale, ditherAmplitude);
+  gradientBandCacheStyle = backgroundStyle;
+  gradientBandCacheColor = topColor;
+}
+
 void drawCachedTopGradientBackground(TFT_eSprite& s, BackgroundStyle style, uint16_t topColor, int ditherPattern,
                                      int ditherScale, int ditherAmplitude) {
   if (gradientBandCache == nullptr) {
     drawTopGradientBackground(s, topColor, ditherPattern, ditherScale, ditherAmplitude);
     return;
   }
-
-  if (gradientBandCacheStyle != style || gradientBandCacheColor != topColor) {
-    buildGradientColorsFromTop(topColor, activeGradientColors, kGradientStopCount);
-    buildGradientBandCache(activeGradientColors, kGradientStops, kGradientStopCount, ditherPattern, ditherScale, ditherAmplitude);
-    gradientBandCacheStyle = style;
-    gradientBandCacheColor = topColor;
-  }
-  clearRenderSurface(s);
+  ensureBackgroundGradientCacheCurrent();
   s.pushImage(0, 0, SCREEN_W, BACKGROUND_GRADIENT_H, gradientBandCache);
+}
+
+// Row-range-aware background draw so the (potentially costly, full-width)
+// gradient cache copy can be split across both cores like the other
+// entity layers, instead of running as a single unsplit task. The cache
+// must already be current (ensureBackgroundGradientCacheCurrent(), called
+// once serially before these run in parallel - see renderScenePhased()).
+// Styles that aren't worth splitting (flat black, flowers) just run the
+// whole thing on the first chunk and no-op on the rest.
+void drawBackgroundRange(TFT_eSprite& s, int y0, int rowCount) {
+  if (rowCount <= 0) return;
+  switch (backgroundStyle) {
+    case BACKGROUND_STYLE_DITHERED:
+    case BACKGROUND_STYLE_SMOOTH: {
+      if (gradientBandCache == nullptr) {
+        if (y0 == 0) drawBackground(s, 0.0f);
+        return;
+      }
+      // Only fill the part of this chunk the gradient copy below won't
+      // immediately overwrite - filling the whole chunk first would mean
+      // every gradient row gets written twice.
+      int copyStart = y0;
+      int copyEnd = min(y0 + rowCount, BACKGROUND_GRADIENT_H);
+      if (copyStart < copyEnd) {
+        s.pushImage(0, copyStart, SCREEN_W, copyEnd - copyStart,
+                    gradientBandCache + (size_t)copyStart * SCREEN_W);
+      }
+      int fillStart = max(y0, BACKGROUND_GRADIENT_H);
+      int fillEnd = y0 + rowCount;
+      if (fillStart < fillEnd) {
+        s.fillRect(0, fillStart, SCREEN_W, fillEnd - fillStart, BG_COLOR);
+      }
+      break;
+    }
+    default:
+      if (y0 == 0) drawBackground(s, 0.0f);
+      break;
+  }
 }
 
 void allocateGradientBandCache() {
@@ -4310,6 +4408,50 @@ static void otaDrawStatus(const char* line1, const char* line2 = nullptr) {
   }
 }
 
+// Small OK/Force Update prompt shown when the installed version is already
+// current. Drawn directly on tft like otaDrawStatus (the OTA flow is
+// already fully blocking/synchronous, so this polls input directly rather
+// than going through the normal per-frame menu dispatch). Rotate to toggle
+// between the two options, push to confirm; K0 cancels (same as "OK").
+static bool otaConfirmForceUpdate(const char* installedVer, const char* latestVer) {
+  int selected = 0;  // 0 = OK, 1 = Force Update
+  const char* labels[2] = {"OK", "Force Update"};
+  const int buttonY = SCREEN_H / 2 + 30;
+  const int buttonX[2] = {SCREEN_W / 2 - 70, SCREEN_W / 2 + 10};
+  const int buttonW[2] = {60, 120};
+
+  auto draw = [&]() {
+    tft.fillScreen(BG_COLOR);
+    tft.setTextFont(2);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_CYAN, BG_COLOR);
+    tft.drawString("Already up to date", SCREEN_W / 2, SCREEN_H / 2 - 28);
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Installed %s = %s", installedVer, latestVer);
+    tft.setTextColor(TFT_WHITE, BG_COLOR);
+    tft.drawString(msg, SCREEN_W / 2, SCREEN_H / 2 - 8);
+
+    for (int i = 0; i < 2; ++i) {
+      uint16_t bg = (selected == i) ? TFT_NAVY : TFT_BLACK;
+      tft.fillRect(buttonX[i], buttonY - 10, buttonW[i], 20, bg);
+      tft.setTextColor(TFT_WHITE, bg);
+      tft.drawString(labels[i], buttonX[i] + buttonW[i] / 2, buttonY);
+    }
+  };
+
+  draw();
+  for (;;) {
+    int delta = inputReadEncoderDelta();
+    if (delta != 0) {
+      selected = (selected == 0) ? 1 : 0;
+      draw();
+    }
+    if (inputEncoderPressed()) return selected == 1;
+    if (inputK0Pressed()) return false;
+    delay(20);
+  }
+}
+
 static void otaProgressCallback(size_t done, size_t total) {
   char pct[8];
   snprintf(pct, sizeof(pct), "%u%%", total ? (unsigned)((done * 100ULL) / total) : 0);
@@ -4399,6 +4541,12 @@ static bool fetchLatestVersionTag(WiFiClientSecure& client, HTTPClient& http, ch
 }
 
 static void runOtaUpdate() {
+  // Pauses the aquarium scene draw+push for as long as this function is on
+  // the stack (every path back out, including early returns, via the
+  // destructor) - this function's screens all draw directly on tft, which
+  // would otherwise race with the display task's async DMA pushes on the
+  // same SPI peripheral.
+  ScopedRenderSuspend renderGuard;
   logHeap("runOtaUpdate start");
   if (!wifiConnected) {
     otaDrawStatus("Update failed", "WiFi not connected");
@@ -4435,12 +4583,12 @@ static void runOtaUpdate() {
     Serial.printf("[OTA] installed=%s latest=%s\n", kFirmwareVersion, latestTag);
     if (compareVersions(latestTag, kFirmwareVersion) <= 0) {
       // Show both versions on screen (not just Serial) since that's what's
-      // actually reachable without a working serial console.
-      char msg[32];
-      snprintf(msg, sizeof(msg), "Installed %s = %s", kFirmwareVersion, latestTag);
-      otaDrawStatus("Already up to date", msg);
-      delay(2500);
-      return;
+      // actually reachable without a working serial console. Offer a
+      // Force Update escape hatch instead of just bailing out - useful for
+      // re-flashing the exact same version (recovering from a bad flash)
+      // without needing a cable.
+      if (!otaConfirmForceUpdate(kFirmwareVersion, latestTag)) return;
+      Serial.println("[OTA] forcing update despite no newer version");
     }
   } else {
     Serial.println("[OTA] version check failed, downloading anyway");
@@ -4873,7 +5021,8 @@ void drawMenuOverlay(TFT_eSprite& s) {
 // task only ever pushes an already-fully-drawn buffer from a previous
 // renderFrame() call), so this is safe and keeps push latency unaffected.
 enum RenderTaskKind : uint8_t {
-  RT_BACKGROUND,  // background + ascii-clock-bg + snail (single task)
+  RT_BACKGROUND,         // row-range background fill/gradient
+  RT_BACKGROUND_EXTRAS,  // ascii-clock-bg + snail (single task)
   RT_SEAWEED,
   RT_BUBBLES,
   RT_FLAKES,
@@ -4897,7 +5046,9 @@ static void executeRenderTask(const RenderTask& t) {
   TFT_eSprite& s = *renderTargetSprite;
   switch (t.kind) {
     case RT_BACKGROUND:
-      drawBackground(s, renderTSec);
+      drawBackgroundRange(s, t.start, t.count);
+      break;
+    case RT_BACKGROUND_EXTRAS:
       drawAsciiClockBackground(s);
       drawSnail(s);
       break;
@@ -4990,8 +5141,26 @@ void renderScenePhased(TFT_eSprite& s) {
   renderTSec = aquariumTimeSec();
 
   {
-    RenderTask t{RT_BACKGROUND, 0, 0};
-    runRenderPhase(&t, 1);
+    // Cache rebuild (if the gradient's colour/style actually changed since
+    // last frame - rare in steady state) must happen serially before the
+    // row-range chunks below run concurrently on both cores.
+    ensureBackgroundGradientCacheCurrent();
+    static const int kTasks = 4;
+    RenderTask tasks[kTasks];
+    int n = 0;
+    for (int i = 0; i < kTasks; ++i) {
+      int start, count;
+      splitIntoChunks(SCREEN_H, kTasks, i, start, count);
+      if (count > 0) tasks[n++] = RenderTask{RT_BACKGROUND, (int16_t)start, (int16_t)count};
+    }
+    runRenderPhase(tasks, n);
+    // Separate phase (not bundled with the chunks above): clock-bg/snail
+    // draw *on top of* the background, so they must not run concurrently
+    // with it - a chunk finishing after them on the other core would just
+    // paint over them. The barrier above guarantees every background chunk
+    // is done before this starts.
+    RenderTask extras{RT_BACKGROUND_EXTRAS, 0, 0};
+    runRenderPhase(&extras, 1);
   }
   {
     static const int kTasks = 4;
@@ -5071,12 +5240,59 @@ void renderScenePhased(TFT_eSprite& s) {
 // actually blocks, so core 0's IDLE0 task (priority 0) never gets scheduled
 // - which starves it long enough to trip the task watchdog. The explicit
 // vTaskDelay(1) guarantees IDLE0 a scheduling window every cycle.
+// Pushed via DMA in horizontal bands rather than TFT_eSprite::pushSprite().
+// TFT_eSPI's non-DMA SPI write pokes the SPI peripheral's 32-pixel hardware
+// FIFO directly, and on the S3 each of those ~2400 refills for a full frame
+// needs an extra register "update" handshake the S3's SPI peripheral
+// requires - that per-chunk overhead measured ~2.6x the theoretical 80MHz
+// transfer time. DMA hands the whole band to the peripheral in one shot.
+// Bands are kept at/under 16384 px (0x4000) each: pushImageDMA() silently
+// falls back to the slow per-chunk path above that threshold, so anything
+// bigger would defeat the point.
+static constexpr int kDmaBandRows = 48;  // 320*48 = 15360 px, under the 16384 cap
+
+// The sprite buffers live in PSRAM (TFT_eSprite only skips PSRAM and uses
+// internal DRAM if DMA is already enabled *before* createSprite() runs - our
+// buffers are far too big for that to be an option, see setup()). Handing a
+// raw PSRAM pointer straight to the SPI DMA engine is exactly what that
+// library heuristic exists to avoid (cache/alignment hazards), so each band
+// is memcpy'd into one of these two small internal-RAM, DMA-capable bounce
+// buffers before the transfer - ping-ponged so a copy for the next band can
+// never land on a buffer whose previous DMA transfer hasn't finished yet.
+static uint16_t* dmaBandBuffer[2] = {nullptr, nullptr};
+static bool dmaPushAvailable = false;
+
 static void displayTaskFn(void*) {
   int idx;
   for (;;) {
     if (xQueueReceive(pushQueue, &idx, portMAX_DELAY) == pdTRUE) {
       unsigned long t0 = micros();
-      frameBuffers[idx]->pushSprite(0, 0);
+      uint16_t* buf = (uint16_t*)frameBuffers[idx]->getPointer();
+      if (dmaPushAvailable) {
+        tft.startWrite();
+        // NOTE: no setSwapBytes(true) here (removed in v1.0.36). It was
+        // added in v1.0.26 after a solid-magenta DMA test came back green,
+        // which looked like a byte-order problem - but magenta (R=B, G=0)
+        // can't distinguish a byte-swap bug from plain garbage, and at that
+        // point the real SPI_DMA_CONF_REG bug (dma_end_callback indexing
+        // the wrong register copy, fixed in v1.0.32 - see that function's
+        // comment in TFT_eSPI_ESP32_S3.c) was still present, so the
+        // peripheral wasn't reading fresh DMA data at all. The "green"
+        // result was most likely stale FIFO content, not a real byte-order
+        // mismatch. With the actual bug fixed, this swap was instead
+        // actively corrupting colours - confirmed on real hardware once the
+        // full scene was visible: warm colours (red/orange/yellow) were
+        // coming out blue/purple, which matches byte-swapping those RGB565
+        // values, not a coincidence.
+        int band = 0;
+        for (int y = 0; y < SCREEN_H; y += kDmaBandRows, ++band) {
+          int h = min(kDmaBandRows, SCREEN_H - y);
+          tft.pushImageDMA(0, y, SCREEN_W, h, buf + (size_t)y * SCREEN_W, dmaBandBuffer[band & 1]);
+        }
+        tft.endWrite();  // waits for the last band's DMA transfer to finish
+      } else {
+        frameBuffers[idx]->pushSprite(0, 0);
+      }
       lastPushMs = (micros() - t0) / 1000.0f;
       xSemaphoreGive(bufferFreeSem[idx]);
     }
@@ -5135,16 +5351,31 @@ void setup() {
   // as white with it left on.
   tft.invertDisplay(false);
   tft.setRotation(1);
-  // DIAGNOSTIC: LEDC PWM backlight control (added v1.0.13) is disabled here
-  // for now. Screen corruption survived both the buffer-race fix (v1.0.15)
-  // and reverting SPI to 40MHz (v1.0.16), and the user confirmed v1.0.10 -
-  // before PWM backlight existed - never showed this. PWM-switching the
-  // backlight can inject ground-bounce/noise into a shared breadboard power
-  // rail, which is exactly the kind of thing that corrupts an adjacent SPI
-  // bus. Testing with a plain on/off backlight to isolate this; brightness
-  // menu item has no effect while this is disabled.
-  pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
+  // Root cause of the earlier "DMA push never errors but the screen never
+  // updates" mystery turned out to be dma_end_callback indexing the wrong
+  // SPI_DMA_CONF_REG copy (fixed in TFT_eSPI_ESP32_S3.c, see that function's
+  // comment), not CS ownership - ctrl_cs=false keeps CS software-controlled
+  // via startWrite()/endWrite() (matching the rest of the sketch) so the
+  // ESP-IDF driver doesn't take over TFT_CS, which the OTA progress screen
+  // still drives directly outside a sprite.
+  tft.initDMA(false);
+  {
+    size_t bandBytes = (size_t)kDmaBandRows * SCREEN_W * sizeof(uint16_t);
+    dmaBandBuffer[0] = (uint16_t*)heap_caps_malloc(bandBytes, MALLOC_CAP_DMA);
+    dmaBandBuffer[1] = (uint16_t*)heap_caps_malloc(bandBytes, MALLOC_CAP_DMA);
+    dmaPushAvailable = (dmaBandBuffer[0] != nullptr) && (dmaBandBuffer[1] != nullptr);
+  }
+  // Re-enabling LEDC PWM backlight control (v1.0.38) - disabled since v1.0.17
+  // after it caused screen corruption by injecting noise onto the shared
+  // breadboard power rail (confirmed by isolating PWM as the one variable
+  // that mattered, independent of SPI speed). Worth retrying now that the
+  // board is powered properly (was drawing through a phone's USB port,
+  // since fixed) instead of the marginal supply that was likely the real
+  // culprit. Must be attached after tft.init(), which otherwise re-asserts
+  // TFT_BL as a plain digital output and undoes this. Revert to the plain
+  // digitalWrite(TFT_BL, HIGH) below if corruption reappears.
+  ledcAttach(TFT_BL, 5000, 8);
+  applyLcdBrightness();
   tft.fillScreen(BG_COLOR);
   tft.setTextWrap(false);
   tft.setTextFont(2);
@@ -5246,7 +5477,7 @@ void loop() {
   updateSnail(aquariumNowMs, dt);
   updateJellyfish(aquariumNowMs, dt);
   if (fishAvoidanceEnabled()) keepVisitorsSeparated();
-  renderFrame();
+  if (!suspendSceneRender) renderFrame();
 
   frameCount++;
   if (now - fpsTimer >= 500) {
