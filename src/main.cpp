@@ -27,8 +27,23 @@
 #include <HTTPClient.h>
 #include <Update.h>
 #include <esp_heap_caps.h>
+#ifdef LAUNCHER_GUEST_MODE
+#include <esp_partition.h>
+#include <esp_ota_ops.h>
+#endif
 #include <time.h>
 #include "Input.h"
+
+// Optional, gitignored dev convenience: pre-provision WiFi credentials at
+// first boot instead of entering them via the on-device encoder character
+// picker every time NVS gets wiped (e.g. reflashing with a different
+// partition table - see the "launcher guest" env in platformio.ini).
+// Copy include/wifi_secrets.h.example to include/wifi_secrets.h and fill in
+// real values; nothing changes if that file doesn't exist. See
+// loadPersistentState()'s use of WIFI_DEFAULT_SSID/WIFI_DEFAULT_PASSWORD.
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#endif
 
 // Temporary diagnostic: log free heap and the largest contiguous free block
 // (what actually matters for a big mbedTLS/WiFi allocation) at each WiFi/OTA
@@ -2721,6 +2736,18 @@ void loadPersistentState() {
   }
   prefs.end();
 
+#ifdef WIFI_DEFAULT_SSID
+  // Only kicks in if nothing's been saved/entered yet - never overrides
+  // credentials the user actually configured on-device.
+  if (wifiSsid[0] == '\0') {
+    copySafe(wifiSsid, sizeof(wifiSsid), WIFI_DEFAULT_SSID);
+#ifdef WIFI_DEFAULT_PASSWORD
+    copySafe(wifiPass, sizeof(wifiPass), WIFI_DEFAULT_PASSWORD);
+#endif
+    wifiEnabled = true;
+  }
+#endif
+
   fishTargetCount = clampVal(fishTargetCount, MIN_FISH, MAX_FISH);
   bubbleTargetCount = clampVal(bubbleTargetCount, MIN_BUBBLES, MAX_BUBBLES);
   octopusFrequency = normalizeOctopusFrequency(octopusFrequency);
@@ -5332,6 +5359,65 @@ void renderFrame() {
   drawBufferIndex ^= 1;
 }
 
+#ifdef LAUNCHER_GUEST_MODE
+// Reimplements ludodefgh/launcher's components/launcher_client contract
+// directly with Preferences (a thin wrapper over the same underlying NVS
+// APIs the real launcher_client.c calls) instead of vendoring that ESP-IDF
+// component into this Arduino/PlatformIO build. Namespace/keys/proto
+// version must stay in sync with launcher_client.h - see that file's own
+// comment about why they're duplicated rather than shared.
+static void requestLauncherMenuOnNextBoot() {
+  Preferences launcherPrefs;
+  launcherPrefs.begin("launcher", false);
+  launcherPrefs.putUChar("force_menu", 1);
+  launcherPrefs.putUInt("proto_ver", 1);
+  launcherPrefs.end();
+
+  // Writing force_menu alone isn't enough: once otadata has been written
+  // even once (i.e. as soon as any guest app has ever booted), the 2nd-
+  // stage bootloader boots straight from whatever otadata points to and
+  // never falls back to checking "factory" on its own - the launcher's
+  // own code (and therefore whatever reads force_menu) never runs again
+  // otherwise. Point the next boot back at "factory" explicitly - this
+  // was a real bug (ludodefgh/launcher#12, now fixed on that side in
+  // launcher_client.c); mirroring the same fix here since this function
+  // reimplements that contract independently rather than linking against
+  // launcher_client itself.
+  const esp_partition_t* factory =
+      esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, nullptr);
+  if (factory == nullptr) {
+    Serial.println("[LAUNCHER] factory partition not found, can't return to launcher");
+  } else {
+    esp_err_t err = esp_ota_set_boot_partition(factory);
+    if (err != ESP_OK) {
+      Serial.printf("[LAUNCHER] esp_ota_set_boot_partition(factory) failed: %s\n", esp_err_to_name(err));
+    }
+  }
+
+  Serial.println("[LAUNCHER] force_menu set, boot partition set to factory, restarting into launcher menu");
+  Serial.flush();
+  delay(50);
+  ESP.restart();
+}
+
+// Long-press (3s) on K0 hands control back to the launcher's menu. Doesn't
+// suppress K0's normal short-press action (background cycle / menu back) -
+// that still fires immediately on press as usual; this just additionally
+// triggers once the hold crosses the threshold.
+static void serviceLauncherReturnGesture() {
+  static unsigned long k0HeldSinceMs = 0;
+  constexpr unsigned long kLongPressMs = 3000;
+  if (inputK0Held()) {
+    if (k0HeldSinceMs == 0) k0HeldSinceMs = millis();
+    else if (millis() - k0HeldSinceMs >= kLongPressMs) {
+      requestLauncherMenuOnNextBoot();  // does not return
+    }
+  } else {
+    k0HeldSinceMs = 0;
+  }
+}
+#endif
+
 // ===== part: new_setup_loop =====
 // ------------------------------ Setup / Loop ----------------------------------
 void setup() {
@@ -5464,6 +5550,9 @@ void loop() {
 
   updateClock(now);
   menuHandleInput();
+#ifdef LAUNCHER_GUEST_MODE
+  serviceLauncherReturnGesture();
+#endif
   serviceAutoSky();
   serviceBackgroundRainbow(aquariumNowMs);
   serviceWifi(now);

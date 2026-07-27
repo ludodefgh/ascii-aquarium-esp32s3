@@ -1,0 +1,25 @@
+# Partition table for running ASCII Aquarium as a guest app under
+# ludodefgh/launcher (https://github.com/ludodefgh/launcher), instead of
+# this project's normal standalone layout (default_8MB.csv, factory app at
+# 0x10000 - see README.md "Flash").
+#
+# Per the launcher's own "Critical constraint: partitions.csv must match" -
+# this must be byte-identical to the launcher's partitions.csv. Copied from
+# that repo and offsets pinned explicitly (rather than left blank for
+# auto-alignment) to remove any risk of PlatformIO's and ESP-IDF's copies of
+# gen_esp32part.py disagreeing on the auto-aligned result - these exact
+# offsets were confirmed by actually building the launcher (idf.py build,
+# esp32s3 target) and printing its generated partition table.
+#
+# ASCII Aquarium itself only ever occupies app_slot1 in this scheme - the
+# launcher owns bootloader/partition-table/otadata/factory, built and
+# flashed from its own repo (see scripts/build_launcher_guest.sh).
+#
+# Name,         Type, SubType,  Offset,    Size,     Flags
+nvs,            data, nvs,      0x9000,    0x6000,
+otadata,        data, ota,      0xf000,    0x2000,
+factory,        app,  factory,  0x20000,   0x180000,
+app_slot1,      app,  ota_0,    0x1a0000,  0x180000,
+app_slot2,      app,  ota_1,    0x320000,  0x180000,
+app_slot3,      app,  ota_2,    0x4a0000,  0x180000,
+storage,        data, nvs,      0x620000,  0x10000,

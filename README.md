@@ -170,3 +170,31 @@ esptool --chip esp32s3 --port <PORT> --baud 921600 write-flash -z \
 
 Release binaries (including a single merged image flashable at `0x0`) are attached to each
 [GitHub release](../../releases).
+
+## Running as a guest app under ludodefgh/launcher
+
+[ludodefgh/launcher](https://github.com/ludodefgh/launcher) is a separate multi-program
+launcher/bootloader project - a menu (TFT + EC11) that picks which of several independent firmwares
+boots, using fixed OTA partitions instead of reflashing. ASCII Aquarium can run as one of its guest
+apps, in a second PlatformIO environment alongside the normal standalone build above:
+
+- `partitions_launcher_guest.csv` - byte-identical to the launcher's own `partitions.csv` (a hard
+  requirement on the launcher side), with app_slot1 at `0x1a0000` instead of the standalone build's
+  factory app at `0x10000`.
+- `[env:esp32-s3-n8r2-launcher-guest]` in `platformio.ini` builds against that partition table and
+  defines `LAUNCHER_GUEST_MODE`, which gates a small addition in `src/main.cpp`: holding K0 for 3
+  seconds writes `force_menu` to the `launcher` NVS namespace (the same contract
+  `components/launcher_client` implements on the launcher side, reimplemented here with
+  `Preferences` instead of vendoring that ESP-IDF component into an Arduino/PlatformIO build) and
+  reboots back into the launcher's menu.
+- `scripts/build_launcher_guest.sh` builds both projects - the launcher via its own
+  `idf.py`/devcontainer flow (Docker), this one via the `esp32-s3-n8r2-launcher-guest` env - verifies
+  their partition tables actually match byte-for-byte, and prints a single `esptool write_flash`
+  command combining the launcher's bootloader/partition-table/otadata/factory with Aquarium's
+  `firmware.bin` at `app_slot1`. Run it with no arguments to clone the launcher into a throwaway
+  `.launcher-cache/` (gitignored), or pass the path to an existing local checkout to reuse it.
+
+Two separate build systems (PlatformIO/Arduino here, ESP-IDF/`idf.py` for the launcher) by design,
+not merged into one project - see the design discussion in
+[ludodefgh/launcher#11](https://github.com/ludodefgh/launcher/issues/11) for the reasoning and what
+a tighter integration would actually require.

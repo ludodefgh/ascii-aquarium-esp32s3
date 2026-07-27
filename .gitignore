@@ -1,3 +1,5 @@
 .pio/
 .vscode/
 firmware_output/
+.launcher-cache/
+include/wifi_secrets.h
