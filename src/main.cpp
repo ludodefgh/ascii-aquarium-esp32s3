@@ -4157,6 +4157,9 @@ enum MenuItemId {
   MENU_RANDOMIZE_FLOWERS,
   MENU_DEBUG_OVERLAY,
   MENU_EXIT,
+#ifdef LAUNCHER_GUEST_MODE
+  MENU_TRIGGER_CRASH,
+#endif
   MENU_ITEM_COUNT
 };
 
@@ -4184,6 +4187,9 @@ static const char* const kMenuLabels[MENU_ITEM_COUNT] = {
     "Randomize Flowers",
     "Debug Overlay",
     "Exit",
+#ifdef LAUNCHER_GUEST_MODE
+    "Trigger Crash",
+#endif
 };
 
 static const char kCharPickerCharset[] =
@@ -4245,7 +4251,11 @@ static void formatHourly(char* out, size_t cap, int freq) {
 }
 
 static bool menuItemIsAction(MenuItemId id) {
-  return id == MENU_RESPAWN || id == MENU_RANDOMIZE_FLOWERS || id == MENU_EXIT;
+  return id == MENU_RESPAWN || id == MENU_RANDOMIZE_FLOWERS || id == MENU_EXIT
+#ifdef LAUNCHER_GUEST_MODE
+         || id == MENU_TRIGGER_CRASH
+#endif
+      ;
 }
 
 static bool menuItemIsSubmenu(MenuItemId id) {
@@ -4405,6 +4415,17 @@ static void menuActivateItem() {
     menuMode = MENU_MODE_HOME;
     return;
   }
+#ifdef LAUNCHER_GUEST_MODE
+  if (id == MENU_TRIGGER_CRASH) {
+    // Deliberate test aid for ludodefgh/launcher#23's crash-loop failsafe -
+    // abort() panics immediately (ESP_RST_PANIC), unlike esp_restart() which
+    // is a normal reset the launcher won't count as a crash.
+    Serial.println("[LAUNCHER] MENU_TRIGGER_CRASH selected, aborting on purpose");
+    Serial.flush();
+    delay(50);
+    abort();
+  }
+#endif
   if (id == MENU_CLOCK_SET) {
     menuMode = MENU_MODE_CLOCK_EDIT;
     return;
@@ -5528,6 +5549,16 @@ void setup() {
   if (wifiEnabled) {
     setWifiStatus(wifiSsid[0] ? "Starting..." : "Ready to scan");
   }
+
+#ifdef LAUNCHER_GUEST_MODE
+  // Confirms this boot valid to the launcher's bootloader-level rollback
+  // (ludodefgh/launcher#25): without this call, every launcher selection
+  // stays PENDING_VERIFY and a single crash rolls back to the launcher
+  // instead of getting a few tries first. Called here since setup() reaching
+  // this point (display + buffers initialized) is as good a health signal as
+  // this sketch has.
+  esp_ota_mark_app_valid_cancel_rollback();
+#endif
 
   delay(350);
   tft.fillScreen(BG_COLOR);
