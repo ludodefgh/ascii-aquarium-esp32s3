@@ -57,7 +57,7 @@ static void logHeap(const char* where) {
 // Bump this on every release - it's what "Check for Update" compares
 // against the latest GitHub release tag to decide whether there's actually
 // anything newer to download.
-static constexpr const char* kFirmwareVersion = "v1.0.47";
+static constexpr const char* kFirmwareVersion = "v1.0.48";
 static constexpr const char* kSketchVersionLabel = kFirmwareVersion;
 
 // GitHub's "latest/download/<asset>" URL always redirects to whatever
@@ -5437,6 +5437,23 @@ static void serviceLauncherReturnGesture() {
     k0HeldSinceMs = 0;
   }
 }
+
+// Confirms this boot valid to the launcher's bootloader-level rollback
+// (ludodefgh/launcher#25): without this call, every launcher selection stays
+// PENDING_VERIFY and a single crash rolls back to the launcher instead of
+// getting a few tries first. Delayed rather than called immediately in
+// setup() so the rollback protection window actually covers a few seconds of
+// real running, not just "did setup() itself not crash" - a bug that only
+// shows up shortly after startup would otherwise already be "confirmed
+// valid" and go uncaught. Runs from loop() (not a delay() in setup()) so
+// normal boot isn't slowed down waiting for it.
+static void serviceRollbackConfirmation(unsigned long now) {
+  static bool confirmed = false;
+  constexpr unsigned long kConfirmDelayMs = 20000;
+  if (confirmed || now < kConfirmDelayMs) return;
+  confirmed = true;
+  esp_ota_mark_app_valid_cancel_rollback();
+}
 #endif
 
 // ===== part: new_setup_loop =====
@@ -5550,16 +5567,6 @@ void setup() {
     setWifiStatus(wifiSsid[0] ? "Starting..." : "Ready to scan");
   }
 
-#ifdef LAUNCHER_GUEST_MODE
-  // Confirms this boot valid to the launcher's bootloader-level rollback
-  // (ludodefgh/launcher#25): without this call, every launcher selection
-  // stays PENDING_VERIFY and a single crash rolls back to the launcher
-  // instead of getting a few tries first. Called here since setup() reaching
-  // this point (display + buffers initialized) is as good a health signal as
-  // this sketch has.
-  esp_ota_mark_app_valid_cancel_rollback();
-#endif
-
   delay(350);
   tft.fillScreen(BG_COLOR);
   lastMs = millis();
@@ -5583,6 +5590,7 @@ void loop() {
   menuHandleInput();
 #ifdef LAUNCHER_GUEST_MODE
   serviceLauncherReturnGesture();
+  serviceRollbackConfirmation(now);
 #endif
   serviceAutoSky();
   serviceBackgroundRainbow(aquariumNowMs);
