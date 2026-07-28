@@ -1,0 +1,119 @@
+name: Launcher sync release
+
+# Manually-triggered: run this whenever ludodefgh/launcher has been updated
+# and you want a fresh, ready-to-flash bundle (launcher binaries + the
+# current Aquarium guest build) published as a GitHub release here.
+#
+# This does NOT bump kFirmwareVersion and is unrelated to the OTA
+# guest-download manifest (manifest.json on the vX.Y.Z release tags) -- the
+# launcher's own binaries (bootloader/partition-table/otadata/app) can only
+# ever be applied via a full physical reflash (USB/EspOtg), never over the
+# launcher's own OTA menu. See CLAUDE.md's "Running as a guest app" section
+# for the full picture.
+
+on:
+  workflow_dispatch:
+    inputs:
+      launcher_ref:
+        description: "Branch/tag/sha to build from ludodefgh/launcher"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ASCII Aquarium
+        uses: actions/checkout@v4
+
+      - name: Checkout ludodefgh/launcher
+        uses: actions/checkout@v4
+        with:
+          repository: ludodefgh/launcher
+          ref: ${{ inputs.launcher_ref }}
+          path: launcher
+
+      - name: Record launcher commit
+        id: launcher_sha
+        run: echo "sha=$(git -C launcher rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build launcher (idf.py, esp32s3) via Docker
+        run: |
+          docker run --rm -v "${{ github.workspace }}/launcher":/workspaces/launcher \
+            -w /workspaces/launcher espressif/idf:release-v5.5 \
+            bash -c '. $IDF_PATH/export.sh && idf.py set-target esp32s3 && idf.py build'
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: platformio-${{ hashFiles('platformio.ini') }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build Aquarium guest env
+        run: pio run -e esp32-s3-n8r2-launcher-guest
+
+      - name: Verify partition tables match
+        run: |
+          diff -q launcher/build/partition_table/partition-table.bin \
+                   .pio/build/esp32-s3-n8r2-launcher-guest/partitions.bin || {
+            echo "::error::partition tables differ between launcher and aquarium guest build - refusing to release" >&2
+            exit 1
+          }
+
+      - name: Assemble release assets
+        id: assets
+        run: |
+          mkdir -p release-assets
+          cp launcher/build/bootloader/bootloader.bin       release-assets/launcher-bootloader.bin
+          cp launcher/build/partition_table/partition-table.bin release-assets/launcher-partition-table.bin
+          cp launcher/build/ota_data_initial.bin             release-assets/launcher-ota_data_initial.bin
+          cp launcher/build/launcher.bin                     release-assets/launcher-app.bin
+          cp .pio/build/esp32-s3-n8r2-launcher-guest/firmware.bin release-assets/aquarium-guest.bin
+
+          AQUARIUM_VERSION=$(grep -oP 'kFirmwareVersion = "\K[^"]+' src/main.cpp)
+          echo "aquarium_version=$AQUARIUM_VERSION" >> "$GITHUB_OUTPUT"
+
+          TAG="launcher-sync-$(date +%Y%m%d)-${{ steps.launcher_sha.outputs.sha }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        run: |
+          cat > release-notes.md <<EOF
+          Bundles a fresh build of [ludodefgh/launcher](https://github.com/ludodefgh/launcher/commit/$(git -C launcher rev-parse HEAD))
+          (\`${{ steps.launcher_sha.outputs.sha }}\`) with the current ASCII Aquarium guest build
+          (\`${{ steps.assets.outputs.aquarium_version }}\`, unchanged - only the launcher moved).
+
+          Not a new Aquarium version and not related to the OTA guest-download
+          manifest. Flash the whole set over USB or via EspOtg:
+
+          \`\`\`
+          esptool --chip esp32s3 -p /dev/ttyACM0 -b 921600 \\
+            --before default-reset --after hard-reset write-flash \\
+            --flash_mode dio --flash_size 8MB --flash_freq 80m \\
+            0x0      launcher-bootloader.bin \\
+            0x8000   launcher-partition-table.bin \\
+            0xf000   launcher-ota_data_initial.bin \\
+            0x20000  launcher-app.bin \\
+            0x1a0000 aquarium-guest.bin
+          \`\`\`
+          EOF
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.assets.outputs.tag }}" \
+            --title "Launcher sync $(date +%Y-%m-%d) (launcher@${{ steps.launcher_sha.outputs.sha }})" \
+            --notes-file release-notes.md \
+            release-assets/*
