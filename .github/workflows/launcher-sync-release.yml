@@ -127,24 +127,30 @@ jobs:
           EOF
 
       - name: Create or update release
-        # Always the same tag (launcher-sync-latest), never a fresh dated
-        # tag: this is a rolling convenience bundle, not a version release --
-        # a new tag each run would (a) always sort above real vX.Y.Z
-        # releases in the release list purely by publish date, and (b) steal
-        # the "Latest" badge from the actual latest Aquarium version, since
-        # gh release create defaults --latest to "most recent by date".
-        # Editing an existing release in place keeps its original publish
-        # date, so it stays out of the way instead of floating to the top.
+        # Tag is <aquarium_version>-launcher-sync (e.g. v1.0.50-launcher-sync),
+        # so it reads as "belongs to v1.0.50" instead of a mystery entry --
+        # but note this only helps at a glance, not GitHub's own release
+        # list ordering. GitHub sorts releases purely by publish date, never
+        # by tag/title text, so renaming can't reorder it: whatever was
+        # published most recently sits at the top regardless of its name.
+        # Editing the same tag in place across reruns (rather than minting a
+        # fresh one each time) at least keeps its publish date fixed once
+        # created, and --prerelease flags it as visually distinct from real
+        # vX.Y.Z releases -- those are the only two levers actually
+        # available here. A new tag (and a fresh top-of-list appearance) is
+        # still unavoidable the first time this runs after each real
+        # kFirmwareVersion bump.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="launcher-sync-latest"
-          TITLE="Launcher sync bundle (updated $(date +%Y-%m-%d), launcher@${{ steps.launcher_sha.outputs.sha }})"
+          TAG="${{ steps.assets.outputs.aquarium_version }}-launcher-sync"
+          TITLE="Launcher sync bundle for ${{ steps.assets.outputs.aquarium_version }} (updated $(date +%Y-%m-%d), launcher@${{ steps.launcher_sha.outputs.sha }})"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --title "$TITLE" --notes-file release-notes.md
             gh release upload "$TAG" release-assets/* --clobber
           else
             gh release create "$TAG" \
+              --prerelease \
               --title "$TITLE" \
               --notes-file release-notes.md \
               --latest=false \
