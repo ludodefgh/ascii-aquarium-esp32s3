@@ -113,3 +113,30 @@ docker run --rm -v "$SCRATCH":/workspaces/launcher -w /workspaces/launcher espre
 esptool --chip esp32s3 -p /dev/ttyACM0 -b 921600 --before default_reset --after hard_reset \
   write_flash 0x0 combined.bin
 ```
+
+### OTA manifest — every release needs `launcher.manifest.json`
+
+The launcher's OTA download flow resolves this repo's actual GitHub releases via
+`"github_repo": "ludodefgh/ascii-aquarium-esp32s3"` in the launcher operator's own manifest (no more
+hand-maintained per-version entries — that was a workaround, since obsoleted by
+[launcher#29](https://github.com/ludodefgh/launcher/issues/29)). For the launcher to auto-pick the
+right binary per chip target from any given release, **that release must carry an asset named
+exactly `launcher.manifest.json`** — schema documented at
+[`ludodefgh/launcher/docs/launcher-manifest.md`](https://github.com/ludodefgh/launcher/blob/main/docs/launcher-manifest.md).
+Without it, the launcher falls back to showing the user a raw asset list to pick from manually —
+not broken, just not automatic.
+
+`scripts/build_launcher_guest.sh` writes a correct one to `firmware_output/launcher.manifest.json`
+after building; `.github/workflows/launcher-sync-release.yml` generates and attaches it
+automatically. **When cutting a release by hand (bumping `kFirmwareVersion`), don't forget to
+attach it too** — minimal form if the release doesn't bundle the launcher's own binaries:
+
+```json
+{
+  "targets": { "esp32s3": "aquarium-guest.bin" }
+}
+```
+
+Add `"flash_images"` (see the schema doc) only if `launcher-bootloader.bin`,
+`launcher-partition-table.bin`, `launcher-ota_data_initial.bin`, and `launcher-app.bin` are also
+attached to that same release.

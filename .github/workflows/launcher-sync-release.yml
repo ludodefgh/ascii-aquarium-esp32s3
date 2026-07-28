@@ -87,6 +87,26 @@ jobs:
           TAG="launcher-sync-$(date +%Y%m%d)-${{ steps.launcher_sha.outputs.sha }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Write launcher.manifest.json
+        # Schema: https://github.com/ludodefgh/launcher/blob/main/docs/launcher-manifest.md
+        run: |
+          cat > release-assets/launcher.manifest.json <<'EOF'
+          {
+            "targets": {
+              "esp32s3": "aquarium-guest.bin"
+            },
+            "flash_images": {
+              "esp32s3": [
+                {"file": "launcher-bootloader.bin", "offset": "0x0"},
+                {"file": "launcher-partition-table.bin", "offset": "0x8000"},
+                {"file": "launcher-ota_data_initial.bin", "offset": "0xf000"},
+                {"file": "launcher-app.bin", "offset": "0x20000"},
+                {"file": "aquarium-guest.bin", "offset": "0x1a0000"}
+              ]
+            }
+          }
+          EOF
+
       - name: Write release notes
         run: |
           cat > release-notes.md <<EOF

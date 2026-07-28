@@ -53,6 +53,26 @@ if ! diff -q "$LAUNCHER_BUILD/partition_table/partition-table.bin" \
 fi
 echo "    OK - identical"
 
+mkdir -p "$AQUARIUM_DIR/firmware_output"
+MANIFEST="$AQUARIUM_DIR/firmware_output/launcher.manifest.json"
+cat > "$MANIFEST" <<'EOF'
+{
+  "targets": {
+    "esp32s3": "aquarium-guest.bin"
+  },
+  "flash_images": {
+    "esp32s3": [
+      {"file": "launcher-bootloader.bin", "offset": "0x0"},
+      {"file": "launcher-partition-table.bin", "offset": "0x8000"},
+      {"file": "launcher-ota_data_initial.bin", "offset": "0xf000"},
+      {"file": "launcher-app.bin", "offset": "0x20000"},
+      {"file": "aquarium-guest.bin", "offset": "0x1a0000"}
+    ]
+  }
+}
+EOF
+echo "==> Wrote $MANIFEST"
+
 cat <<EOF
 
 ==> Flash with (replace /dev/ttyUSB0 with your port):
@@ -70,4 +90,10 @@ This flashes the launcher itself (bootloader/partition-table/otadata/
 factory) plus ASCII Aquarium into app_slot1. First boot (no "last app"
 remembered in NVS) shows the launcher's menu; picking Aquarium boots it.
 Long-press K0 for 3s inside Aquarium returns to that menu.
+
+==> If publishing this as a GitHub release, attach $MANIFEST as-is (exact
+filename "launcher.manifest.json") alongside renamed copies of the bins
+above (launcher-bootloader.bin, launcher-partition-table.bin,
+launcher-ota_data_initial.bin, launcher-app.bin, aquarium-guest.bin) - see
+https://github.com/ludodefgh/launcher/blob/main/docs/launcher-manifest.md
 EOF
