@@ -57,7 +57,7 @@ static void logHeap(const char* where) {
 // Bump this on every release - it's what "Check for Update" compares
 // against the latest GitHub release tag to decide whether there's actually
 // anything newer to download.
-static constexpr const char* kFirmwareVersion = "v1.0.48";
+static constexpr const char* kFirmwareVersion = "v1.0.49";
 static constexpr const char* kSketchVersionLabel = kFirmwareVersion;
 
 // GitHub's "latest/download/<asset>" URL always redirects to whatever
@@ -5449,7 +5449,7 @@ static void serviceLauncherReturnGesture() {
 // normal boot isn't slowed down waiting for it.
 static void serviceRollbackConfirmation(unsigned long now) {
   static bool confirmed = false;
-  constexpr unsigned long kConfirmDelayMs = 20000;
+  constexpr unsigned long kConfirmDelayMs = 90000;  // TEMP: widened for manual crash-test retiming
   if (confirmed || now < kConfirmDelayMs) return;
   confirmed = true;
   esp_ota_mark_app_valid_cancel_rollback();
